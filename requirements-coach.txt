@@ -1,0 +1,5 @@
+# Extra runtime deps for the coach pipeline (on top of the local garminconnect package).
+# Install with:  pip install -e . && pip install -r requirements-coach.txt
+curl_cffi
+google-genai
+requests
