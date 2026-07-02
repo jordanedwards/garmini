@@ -180,12 +180,14 @@ still. Model choice here is about reasoning quality, not cost.
 
 - [x] **Stage 0** — Garmin export (`garmin_daily_export.py`): metrics → JSON + dated zip.
 - [x] **Stage 1** — Garmin → Gemini → Telegram (`run_daily.py`, modules in `coach/`), with a
-      `--dry-run` flag. Verified end-to-end on `gemini-2.5-flash`. Coach reads live metrics +
-      `state/` files and returns update text, a revised plan, and calendar ops.
-      - Remaining to go live: message **@GarminiBot** once so the chat id resolves.
+      `--dry-run` flag. Verified end-to-end on `gemini-2.5-flash`, live message delivered. Coach
+      reads live metrics + `state/` files and returns update text, a revised plan, and calendar ops.
 - [ ] **Stage 2** — Add Google Calendar writes. `run_daily.py` already produces calendar ops
       and logs them; Stage 2 applies them to the Training calendar.
       - Needs: the service-account setup in §5.3.
+- [ ] **Stage 3** — Two-way Telegram chat: the athlete replies with context ("workout got cut
+      short", "can't train today — work") and the coach ingests it and adjusts the plan/calendar.
+      Design in §9a below.
 
 ### Running Stage 1
 ```bash
@@ -193,6 +195,69 @@ python3 run_daily.py --dry-run              # print everything, send/write nothi
 python3 run_daily.py --dry-run --skip-export # reuse today's data (don't re-hit Garmin)
 python3 run_daily.py                         # live: Telegram + rewrite training_plan.md
 ```
+
+---
+
+## 9a. Stage 3 design (planned): two-way Telegram chat
+
+Today the flow is one-way (cron → Gemini → you). Stage 3 lets you **reply in the Telegram chat
+to give the coach context** — an interrupted or skipped workout, a work conflict, how the legs
+feel, a schedule change — and have it adjust the plan, load, and calendar accordingly. It reuses
+the existing memory-file model and the `CoachOutput` contract; nothing about the architecture has
+to change.
+
+### The three pieces
+
+**1. Receiving your messages.** Two transport options:
+- **Polling (`getUpdates` with a stored offset)** — a script asks Telegram "anything new since
+  update N?". No public endpoint or TLS needed; fits the headless, no-open-port model. This is how
+  we already discover the chat id. **Recommended.**
+- **Webhook** — Telegram POSTs each message to a public HTTPS URL (nginx → a small FastAPI/Flask
+  app). Instant, but adds a public route, a TLS cert, and an always-up web app. Optional upgrade.
+
+**2. A "context inbox" (memory).** Inbound messages are appended, timestamped, to state files the
+coach reads:
+- `state/athlete_notes.jsonl` — raw inbound notes (append-only).
+- `state/conversation.jsonl` — rolling chat transcript for back-and-forth continuity (bounded to
+  the last N messages / few days to control tokens).
+- `state/telegram_offset` — the last processed Telegram `update_id`, so messages aren't reprocessed.
+
+The coach's prompt then becomes: system prompt + current plan + **live metrics + recent
+notes/conversation**. Its existing structured output (`update_text`, `updated_plan_markdown`,
+`calendar_ops`) already carries any plan/calendar changes back — no new output schema required.
+
+**3. When it reacts (timing).** Your examples are usually *same-day*, so a once-a-day batch isn't
+enough. Two levels:
+
+| | **Phase A — short-cron poller (recommended first)** | **Phase B — always-on listener (later)** |
+|---|---|---|
+| How | New script `coach_listen.py` on a ~20-min cron: pull new messages → append to inbox → if anything new, call the coach with the note + today's context → reply in chat → update plan/calendar | Promote the poller to a **systemd** long-poll service |
+| Feels like | Leave a note, get a reply + adjustment within ~20 min | Real-time chat, replies in seconds |
+| Same-day "skip today"? | Yes | Yes, immediately |
+| New infra | Almost none (reuse `run_daily.py` internals) | A persistent systemd unit |
+| Gemini cost | 1 call per batch that has new messages | 1 call per inbound message |
+
+### New components (Phase A)
+- `coach/telegram_notify.py` → add `get_updates(token, offset)` (read new messages) alongside the
+  existing `send_message`.
+- `coach/inbox.py` → append notes, load recent notes/conversation, read/write the offset.
+- `coach/gemini_coach.py` → a `respond_to_message(...)` entry that includes the inbound note +
+  recent conversation in the context (same `CoachOutput` back).
+- `coach_listen.py` → orchestrator: poll → inbox → (if new) coach → reply + apply plan/calendar.
+- Cron: `*/20 * * * * … coach_listen.py` (in addition to the daily `run_daily.py`).
+
+### Design rules / gotchas
+- **Lock to your chat id** — ignore messages from any other chat that finds the bot.
+- **Offset discipline** — always advance and persist `telegram_offset` so nothing is double-handled.
+- **Bounded memory** — feed only the last N messages / few days of `conversation.jsonl` to the model.
+- **Confirm destructive edits** — for a big change ("scrap this week"), the coach should *propose*
+  and wait for a "confirm" reply before overwriting the plan; calendar writes stay on the dedicated
+  Training calendar only.
+- **Calendar idempotency** — needs the `event_id` tracking from Stage 2 so "move today's session"
+  *updates* the event instead of duplicating it. (This is why Stage 2 comes first.)
+- **Debounce** — if several messages arrive in one window, batch them into a single coach call.
+
+**Recommended sequence:** deploy → Stage 2 (calendar) → Stage 3 Phase A → (optionally) Phase B.
 
 ---
 
