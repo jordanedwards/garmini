@@ -38,6 +38,7 @@ import logging
 import os
 import sys
 import time
+import zipfile
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -245,6 +246,16 @@ def write_json(folder: Path, name: str, data: Any) -> None:
     log.info("wrote %s", name)
 
 
+def zip_export(folder: Path, base: Path, end: date) -> None:
+    """Zip every file in `folder` except summary.json into <base>/<date>.zip."""
+    zip_path = base / f"{end.isoformat()}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(folder.iterdir()):
+            if f.is_file() and f.name != "summary.json":
+                zf.write(f, arcname=f.name)
+    log.info("wrote %s", zip_path.name)
+
+
 def build_summary(
     load: list[dict[str, Any]],
     vo2: list[dict[str, Any]],
@@ -329,6 +340,8 @@ def main() -> int:
     write_json(folder, "heart_rate_summary_current.json", hr_summary)
     write_json(folder, "activities_log.json", activities)
     write_json(folder, "summary.json", build_summary(load, vo2, ftp, load_focus, hr_summary))
+
+    zip_export(folder, base, end)
 
     log.info("Export complete: %s", folder)
     return 0
