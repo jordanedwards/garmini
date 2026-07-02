@@ -1,6 +1,9 @@
 # Custom
 your_data/
 garmin_data/
+.env
+state/gcal_service_account.json
+logs/
 pdm.lock
 .claude/
 
