@@ -14,7 +14,7 @@ Principle: **maintain intensity, cut volume.** Hold sharpness, shed leg fatigue.
 hockey in the final week. Watch HRV — only do quality when it's green.
 
 ### Week of Jun 30 – Jul 5 (Taper Phase 1, ~−25% volume)
-- **Thu Jul 2:** Run: Focused Aerobic & Sweet Spot Efforts. (Warm-up: 15 min easy run (HR 140-150 bpm, Power < 260W). Main Set: 15 min steady Zone 2 (HR 145-155 bpm, Power 260-280W). Then, 3 x 4 min at lower Sweet Spot (HR 160-170 bpm, Power 290-310W) with 2 min easy jog recovery between efforts. Cool-down: 10 min easy run (HR < 145 bpm, Power < 250W). Purpose: Maintain aerobic efficiency and leg speed during the taper, without accumulating fatigue.)
+- **Thu Jul 2:** Focused Aerobic Efficiency & "Sweet Spot" Run.)
 - **Fri Jul 3:** Pool Swim & Structural Core. (1,000m – 1,500m continuous smooth swim. Focus on a high-elbow catch and long body rotation.)
 - **Sat Jul 4:** Long Aerobic Bike + Short Brick Run. (Bike: 90–120 mins steady endurance ride. Target: 130W–150W (Zone 2 cycling). Keep your cadence fluid at 90+ RPM to minimize gear-grinding tension on your lumbar spine.
 
