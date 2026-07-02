@@ -101,6 +101,25 @@ Switch the Gemini model by editing the clearly-marked `GEMINI_MODEL` line in `.e
 
 ---
 
+## Todo:
+
+Create a front end:
+- Google oauth (register/login, calendar access)
+- Set account keys (garmin login, telegram, etc)
+- Settings: location
+- Read and edit season training plan, targets
+- Add races to calendar, with their importance
+- Off season training plan
+
+
+- Finish Calendar integration (update the training calendar automatically)
+- Interactive chat on telegram
+- Refresh plan function
+- Push refresh on new data (maybe have to hook into zapier/strava, or just poll every hour)
+- integrate weather forecast. If it's going to be rainy or hot, offer recommendations or alternatives perhaps. If heat training is needed, it can select days for certain training.
+
+---
+
 ## Credits
 
 Built on [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) by cyberjunky
