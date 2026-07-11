@@ -56,7 +56,7 @@ HRV_WEEKS = 4
 LOAD_WEEKS = 4
 VO2MAX_WEEKS = 4
 LACTATE_WEEKS = 12
-ACTIVITY_DAYS = 2
+ACTIVITY_DAYS = 7
 
 # Small pause between the many per-day calls to stay friendly with rate limits.
 CALL_DELAY_SECONDS = 0.3

@@ -51,11 +51,22 @@ def _login(payload: dict[str, Any]) -> dict[str, Any]:
     if not email or not password:
         return {"status": "error", "message": "Email and password are required."}
 
+    # A prompt_mfa callback that raises only if Garmin actually demands MFA.
+    # Non-MFA accounts never trigger it, so login follows the normal path that
+    # persists the token blob to the token store (return_on_mfa=True skips that).
+    class _MFANeeded(Exception):
+        pass
+
+    def _prompt_mfa() -> str:
+        raise _MFANeeded()
+
     with tempfile.TemporaryDirectory() as tmp:
         tokenstore = Path(tmp)
         try:
-            garmin = Garmin(email=email, password=password, return_on_mfa=True)
-            result = garmin.login(str(tokenstore))
+            garmin = Garmin(email=email, password=password, prompt_mfa=_prompt_mfa)
+            garmin.login(str(tokenstore))
+        except _MFANeeded:
+            return {"status": "needs_mfa"}
         except GarminConnectAuthenticationError:
             return {"status": "error", "message": "Invalid Garmin email or password."}
         except GarminConnectTooManyRequestsError:
@@ -65,17 +76,72 @@ def _login(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001 - always return JSON to the caller
             return {"status": "error", "message": f"Unexpected error: {e!r}"}
 
-        mfa_status = result[0] if isinstance(result, tuple) else result
-        if mfa_status == "needs_mfa":
-            return {"status": "needs_mfa"}
-
         blob = _read_token_blob(tokenstore)
         if blob == "{}":
             return {"status": "error", "message": "Login produced no tokens."}
         return {"status": "connected", "tokens": blob}
 
 
-ACTIONS = {"login": _login}
+def _sync(payload: dict[str, Any]) -> dict[str, Any]:
+    """Restore the stored tokens and pull the compact metric bundle."""
+    tokens_blob = payload.get("tokens")
+    if not tokens_blob:
+        return {"status": "error", "message": "No tokens provided."}
+    try:
+        files = json.loads(tokens_blob)
+    except ValueError:
+        return {"status": "error", "message": "Invalid tokens blob."}
+
+    from datetime import date
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokenstore = Path(tmp)
+        for name, content in files.items():
+            fp = tokenstore / name
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content)
+
+        try:
+            from garminconnect import Garmin
+
+            import garmin_daily_export as gde
+            from coach import metrics as m
+
+            api = Garmin()
+            api.login(str(tokenstore))  # restore session; no credentials/MFA
+            end = date.today()
+
+            ftp = gde.collect_ftp(api)
+            cycling_ftp = ftp.get("cycling") or {}
+            if isinstance(cycling_ftp, list):
+                cycling_ftp = cycling_ftp[0] if cycling_ftp else {}
+            running_ftp = ftp.get("running") or {}
+            zones = gde.collect_hr_zones(api)
+
+            bundle = {
+                "hrv_4week": m._compress_hrv(gde.collect_hrv(api, end)),
+                "training_load_4week": gde.collect_training_load(api, end),
+                "vo2max_4week": m._compress_vo2(gde.collect_vo2max(api, end)),
+                "lactate_threshold_12week": gde.collect_lactate(api, end),
+                "ftp": {
+                    "cyclingFTP": cycling_ftp.get("functionalThresholdPower"),
+                    "runningFTP": running_ftp.get("functionalThresholdPower"),
+                    "runningPowerToWeight": running_ftp.get("powerToWeight"),
+                },
+                "load_focus": m._compress_load_focus(gde.collect_load_focus(api, end)),
+                "heart_rate_zones": zones,
+                "heart_rate_summary": gde.collect_hr_summary(api, end, zones),
+                "recent_activities": m._compress_activities(
+                    gde.collect_activities(api, end)
+                ),
+            }
+        except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+            return {"status": "error", "message": f"Sync failed: {e!r}"}
+
+        return {"status": "connected", "metrics": bundle}
+
+
+ACTIONS = {"login": _login, "sync": _sync}
 
 
 def main() -> int:
