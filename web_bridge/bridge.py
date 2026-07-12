@@ -275,6 +275,31 @@ def _predict_races(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "predictions": [p.model_dump() for p in out.predictions]}
 
 
+def _translate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Translate a batch of English UI strings into a target language."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    strings = payload.get("strings") or []
+    if not strings:
+        return {"status": "ok", "translations": {}}
+
+    try:
+        from coach.gemini_coach import translate
+
+        out = translate(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            target_language=payload.get("target_language") or "French",
+            strings=strings,
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Translate failed: {e!r}"}
+
+    return {"status": "ok", "translations": out}
+
+
 def _resolve_location(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalise a free-text location to a canonical place + IANA timezone."""
     api_key = payload.get("api_key")
@@ -358,6 +383,7 @@ ACTIONS = {
     "motivate": _motivate,
     "predict_races": _predict_races,
     "resolve_location": _resolve_location,
+    "translate": _translate,
     "chat": _chat,
 }
 

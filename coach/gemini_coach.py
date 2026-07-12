@@ -137,6 +137,37 @@ class ResolvedLocation(BaseModel):
     timezone: str  # IANA tz, e.g. "America/Vancouver"
 
 
+def translate(
+    *, api_key: str, model: str, target_language: str, strings: list[str]
+) -> dict[str, str]:
+    """Translate a batch of English UI strings; returns {english: translated}."""
+    client = genai.Client(api_key=api_key)
+
+    system_prompt = (
+        "You are a professional translator localising the UI of Garmini, a triathlon "
+        f"coaching web app, into {target_language}. You are given a JSON array of English "
+        "strings. Return ONLY a JSON object mapping each original English string (verbatim, "
+        "unchanged, as the key) to its natural, concise translation. Rules: keep it idiomatic "
+        "and appropriately short for buttons/labels; preserve HTML tags, :placeholders, {curly} "
+        "placeholders, punctuation, arrows (→), emoji, numbers and units exactly; do NOT translate "
+        "the brand name 'Garmini' or metric abbreviations (VO₂ max, VO2, ACWR, LTHR, HRV, FTP, "
+        "RHR, ACWR); preserve any leading/trailing whitespace."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=json.dumps(strings, ensure_ascii=False),
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            temperature=0.2,
+        ),
+    )
+
+    data = json.loads(response.text or "{}")
+    return {str(k): str(v) for k, v in data.items()}
+
+
 def resolve_location(*, api_key: str, model: str, location: str) -> ResolvedLocation:
     """Normalise a free-text location to a real place + its IANA timezone."""
     client = genai.Client(api_key=api_key)
