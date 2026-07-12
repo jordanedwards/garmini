@@ -178,10 +178,41 @@ def _refresh_plan(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_markdown": out.updated_plan_markdown,
         "update_text": out.update_text,
         "readiness": out.readiness,
+        "daily_sessions": [s.model_dump() for s in out.daily_sessions],
     }
 
 
-ACTIONS = {"login": _login, "sync": _sync, "refresh_plan": _refresh_plan}
+def _chat(payload: dict[str, Any]) -> dict[str, Any]:
+    """Free-form coach chat reply."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+    message = (payload.get("message") or "").strip()
+    if not message:
+        return {"status": "error", "message": "Empty message."}
+
+    try:
+        from coach.gemini_coach import chat_reply
+
+        reply = chat_reply(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            history=payload.get("history") or [],
+            message=message,
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Chat failed: {e!r}"}
+
+    return {"status": "ok", "reply": reply}
+
+
+ACTIONS = {
+    "login": _login,
+    "sync": _sync,
+    "refresh_plan": _refresh_plan,
+    "chat": _chat,
+}
 
 
 def main() -> int:

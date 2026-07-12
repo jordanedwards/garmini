@@ -20,10 +20,18 @@ class CalendarOp(BaseModel):
     event_id: str = ""  # only for update/delete
 
 
+class DailySession(BaseModel):
+    date: str  # YYYY-MM-DD
+    discipline: str  # swim | bike | run | brick | strength | rest | other
+    title: str
+    description: str
+
+
 class CoachOutput(BaseModel):
     update_text: str
     readiness: str  # prime | good | moderate | low
     updated_plan_markdown: str
+    daily_sessions: list[DailySession]  # the next ~14 days, one entry per day
     calendar_ops: list[CalendarOp]
 
 
@@ -63,3 +71,33 @@ def run_coach(
         return parsed
     data: dict[str, Any] = json.loads(response.text)
     return CoachOutput.model_validate(data)
+
+
+def chat_reply(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    history: list[dict[str, str]],
+    message: str,
+) -> str:
+    """Free-form coach chat. `history` is [{'role': 'user'|'coach', 'body': ...}]."""
+    client = genai.Client(api_key=api_key)
+
+    contents: list[types.Content] = []
+    for turn in history:
+        role = "user" if turn.get("role") == "user" else "model"
+        contents.append(
+            types.Content(role=role, parts=[types.Part(text=turn.get("body", ""))])
+        )
+    contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
+
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.7,
+        ),
+    )
+    return response.text or ""
