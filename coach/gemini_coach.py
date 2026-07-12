@@ -132,6 +132,41 @@ def predict_races(
     return RacePredictions.model_validate(data)
 
 
+class ResolvedLocation(BaseModel):
+    location: str  # canonical "City, Region, Country"
+    timezone: str  # IANA tz, e.g. "America/Vancouver"
+
+
+def resolve_location(*, api_key: str, model: str, location: str) -> ResolvedLocation:
+    """Normalise a free-text location to a real place + its IANA timezone."""
+    client = genai.Client(api_key=api_key)
+
+    system_prompt = (
+        "You resolve a user's free-text location to a real-world place. Return the canonical "
+        "name as 'City, Region/State, Country' (correct spelling/casing) and the matching IANA "
+        "timezone identifier (e.g. 'America/Vancouver'). If the input is ambiguous, pick the most "
+        "likely well-known place. If you genuinely cannot resolve it, echo the input as the "
+        "location and use 'UTC' as the timezone."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=f"Location: {location}",
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=ResolvedLocation,
+            temperature=0.0,
+        ),
+    )
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, ResolvedLocation):
+        return parsed
+    data: dict[str, Any] = json.loads(response.text)
+    return ResolvedLocation.model_validate(data)
+
+
 def motivate(
     *,
     api_key: str,

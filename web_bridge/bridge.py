@@ -275,6 +275,30 @@ def _predict_races(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "predictions": [p.model_dump() for p in out.predictions]}
 
 
+def _resolve_location(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a free-text location to a canonical place + IANA timezone."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    location = (payload.get("location") or "").strip()
+    if not location:
+        return {"status": "error", "message": "No location provided."}
+
+    try:
+        from coach.gemini_coach import resolve_location
+
+        out = resolve_location(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            location=location,
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Location resolve failed: {e!r}"}
+
+    return {"status": "ok", "location": out.location, "timezone": out.timezone}
+
+
 def _motivate(payload: dict[str, Any]) -> dict[str, Any]:
     """Write a short, grounded dashboard pep-talk from pre-computed highlights."""
     api_key = payload.get("api_key")
@@ -333,6 +357,7 @@ ACTIONS = {
     "refresh_plan": _refresh_plan,
     "motivate": _motivate,
     "predict_races": _predict_races,
+    "resolve_location": _resolve_location,
     "chat": _chat,
 }
 
