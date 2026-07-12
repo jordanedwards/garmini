@@ -28,6 +28,10 @@ from typing import Any
 
 logging.getLogger("garminconnect").setLevel(logging.CRITICAL)
 
+# Make the coach repo root importable (garmin_daily_export, coach.*) regardless of
+# how the bridge is invoked — Python only adds the script's own dir to sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 def _read_token_blob(tokenstore: Path) -> str:
     """Read every file the login wrote into the token store into a JSON string."""
