@@ -73,6 +73,65 @@ def run_coach(
     return CoachOutput.model_validate(data)
 
 
+class RacePrediction(BaseModel):
+    race_id: int
+    swim: str  # H:MM:SS or M:SS
+    bike: str
+    run: str
+    overall: str  # includes transitions
+    rationale: str  # one sentence
+
+
+class RacePredictions(BaseModel):
+    predictions: list[RacePrediction]
+
+
+def predict_races(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    metrics_json: str,
+    races_json: str,
+    today: str,
+) -> RacePredictions:
+    """Predict swim/bike/run splits + overall finish time for each race.
+
+    Grounded in the athlete's current fitness (FTP, VO2 max, threshold pace/HR,
+    recent activities) and each race's distance and terrain.
+    """
+    client = genai.Client(api_key=api_key)
+
+    user_content = (
+        f"Today's date: {today}.\n\n"
+        f"=== ATHLETE FITNESS (JSON) ===\n{metrics_json}\n\n"
+        f"=== RACES TO PREDICT (JSON) ===\n{races_json}\n\n"
+        "For each race, predict realistic swim, bike and run split times and the overall finish "
+        "time. Base it on the athlete's current fitness (FTP, VO2 max, threshold pace/HR, recent "
+        "activities) and the race's distance and terrain (use the location/notes for hills, "
+        "altitude, water, etc.). Include transitions in the overall time. Format times as H:MM:SS "
+        "(or M:SS for short swims). Give a one-sentence rationale. Return exactly one entry per "
+        "race, echoing its race_id."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=RacePredictions,
+            temperature=0.4,
+        ),
+    )
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, RacePredictions):
+        return parsed
+    data: dict[str, Any] = json.loads(response.text)
+    return RacePredictions.model_validate(data)
+
+
 def motivate(
     *,
     api_key: str,

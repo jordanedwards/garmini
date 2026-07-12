@@ -250,6 +250,31 @@ def _refresh_plan(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _predict_races(payload: dict[str, Any]) -> dict[str, Any]:
+    """Predict swim/bike/run/overall times for each race via Gemini."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    from datetime import date
+
+    try:
+        from coach.gemini_coach import predict_races
+
+        out = predict_races(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            metrics_json=json.dumps(payload.get("metrics") or {}),
+            races_json=json.dumps(payload.get("races") or []),
+            today=payload.get("today") or date.today().isoformat(),
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Race prediction failed: {e!r}"}
+
+    return {"status": "ok", "predictions": [p.model_dump() for p in out.predictions]}
+
+
 def _motivate(payload: dict[str, Any]) -> dict[str, Any]:
     """Write a short, grounded dashboard pep-talk from pre-computed highlights."""
     api_key = payload.get("api_key")
@@ -307,6 +332,7 @@ ACTIONS = {
     "sync": _sync,
     "refresh_plan": _refresh_plan,
     "motivate": _motivate,
+    "predict_races": _predict_races,
     "chat": _chat,
 }
 
