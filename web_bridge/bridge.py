@@ -145,7 +145,43 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "connected", "metrics": bundle}
 
 
-ACTIONS = {"login": _login, "sync": _sync}
+def _refresh_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """Ask Gemini (as coach) to revise the season plan from the user's context."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    from datetime import date
+
+    model = payload.get("model") or "gemini-2.5-flash"
+    system_prompt = payload.get("system_prompt") or ""
+    plan_markdown = payload.get("plan_markdown") or ""
+    metrics = payload.get("metrics") or {}
+    today = payload.get("today") or date.today().isoformat()
+
+    try:
+        from coach.gemini_coach import run_coach
+
+        out = run_coach(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            plan_markdown=plan_markdown,
+            metrics_json=json.dumps(metrics),
+            today=today,
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Coach failed: {e!r}"}
+
+    return {
+        "status": "ok",
+        "plan_markdown": out.updated_plan_markdown,
+        "update_text": out.update_text,
+        "readiness": out.readiness,
+    }
+
+
+ACTIONS = {"login": _login, "sync": _sync, "refresh_plan": _refresh_plan}
 
 
 def main() -> int:
