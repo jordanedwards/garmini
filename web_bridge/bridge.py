@@ -83,6 +83,31 @@ def _monthly_distances(api: Any, end: Any, months: int = 6) -> dict[str, Any]:
     return {mo: {k: round(v, 1) for k, v in vals.items()} for mo, vals in sorted(buckets.items())}
 
 
+def _training_readiness(api: Any, end: Any) -> dict[str, Any] | None:
+    """Latest Training Readiness snapshot (score 0-100 + level + feedback)."""
+    try:
+        data = api.get_training_readiness(end.isoformat())
+    except Exception:  # noqa: BLE001
+        return None
+
+    entries = [data] if isinstance(data, dict) else (data or [])
+    if not entries:
+        return None
+
+    # Prefer the most recent snapshot of the day (ISO timestamps sort lexically).
+    entry = max(entries, key=lambda e: e.get("timestamp") or e.get("calendarDate") or "")
+    score = entry.get("score")
+    if score is None:
+        return None
+
+    return {
+        "score": score,
+        "level": entry.get("level"),
+        "feedback": entry.get("feedbackShort") or entry.get("feedbackLong"),
+        "date": entry.get("calendarDate") or (entry.get("timestamp") or "")[:10],
+    }
+
+
 def _login(payload: dict[str, Any]) -> dict[str, Any]:
     from garminconnect import (
         Garmin,
@@ -180,6 +205,7 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
                     gde.collect_activities(api, end)
                 ),
                 "monthly_distances": _monthly_distances(api, end),
+                "training_readiness": _training_readiness(api, end),
             }
         except Exception as e:  # noqa: BLE001 - always return JSON to the caller
             return {"status": "error", "message": f"Sync failed: {e!r}"}
