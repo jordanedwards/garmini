@@ -224,6 +224,33 @@ def _refresh_plan(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _motivate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Write a short, grounded dashboard pep-talk from pre-computed highlights."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    from datetime import date
+
+    try:
+        from coach.gemini_coach import motivate
+
+        text = motivate(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            athlete=payload.get("athlete") or "the athlete",
+            highlights=payload.get("highlights") or {},
+            today=payload.get("today") or date.today().isoformat(),
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Motivate failed: {e!r}"}
+
+    if not text:
+        return {"status": "error", "message": "Coach returned an empty note."}
+
+    return {"status": "ok", "text": text}
+
+
 def _chat(payload: dict[str, Any]) -> dict[str, Any]:
     """Free-form coach chat reply."""
     api_key = payload.get("api_key")
@@ -253,6 +280,7 @@ ACTIONS = {
     "login": _login,
     "sync": _sync,
     "refresh_plan": _refresh_plan,
+    "motivate": _motivate,
     "chat": _chat,
 }
 

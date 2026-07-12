@@ -73,6 +73,49 @@ def run_coach(
     return CoachOutput.model_validate(data)
 
 
+def motivate(
+    *,
+    api_key: str,
+    model: str,
+    athlete: str,
+    highlights: dict[str, Any],
+    today: str,
+) -> str:
+    """A short, grounded pep-talk for the athlete's dashboard.
+
+    `highlights` is a compact dict of already-computed facts (load ratio, VO2
+    trend, cycling distance, race countdown, next sessions). The model only
+    phrases them — it must not invent numbers.
+    """
+    client = genai.Client(api_key=api_key)
+
+    system_prompt = (
+        "You are an encouraging, sharp endurance triathlon coach writing the note that "
+        "greets one athlete on their dashboard. Write 2-3 short sentences of specific, "
+        "motivating feedback grounded ONLY in the facts provided — never invent numbers. "
+        "Call out real wins (VO2 max climbing, a biggest-ever cycling month, a race getting "
+        "close) and point them at the next thing to do. Warm and energising, second person "
+        "('you'), plain text only (no markdown, no emoji, no lists). If the facts are thin, "
+        "keep it briefly encouraging."
+    )
+
+    user_content = (
+        f"Today's date: {today}.\n"
+        f"Athlete: {athlete}.\n\n"
+        f"Facts (JSON):\n{json.dumps(highlights)}"
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.8,
+        ),
+    )
+    return (response.text or "").strip()
+
+
 def chat_reply(
     *,
     api_key: str,
