@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from google import genai
 from google.genai import types
@@ -29,7 +29,7 @@ class DailySession(BaseModel):
 
 class CoachOutput(BaseModel):
     update_text: str
-    readiness: str  # prime | good | moderate | low
+    readiness: Literal["prime", "good", "moderate", "low"]
     updated_plan_markdown: str
     daily_sessions: list[DailySession]  # the next ~14 days, one entry per day
     calendar_ops: list[CalendarOp]

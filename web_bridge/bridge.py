@@ -42,6 +42,47 @@ def _read_token_blob(tokenstore: Path) -> str:
     return json.dumps(blob)
 
 
+def _sport_bucket(type_key: str | None) -> str | None:
+    tk = (type_key or "").lower()
+    if "swim" in tk:
+        return "swim"
+    if "cycl" in tk or "bik" in tk or "ride" in tk:
+        return "bike"
+    if "run" in tk:
+        return "run"
+    return None
+
+
+def _monthly_distances(api: Any, end: Any, months: int = 6) -> dict[str, Any]:
+    """Sum activity distance (km) by month and sport over the last `months`."""
+    from datetime import date
+
+    y, m = end.year, end.month
+    for _ in range(months - 1):
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    start = date(y, m, 1)
+
+    try:
+        acts = api.get_activities_by_date(start.isoformat(), end.isoformat())
+    except Exception:  # noqa: BLE001
+        return {}
+
+    buckets: dict[str, dict[str, float]] = {}
+    for a in acts or []:
+        sport = _sport_bucket((a.get("activityType") or {}).get("typeKey"))
+        if not sport:
+            continue
+        month = (a.get("startTimeLocal") or "")[:7]
+        if len(month) != 7:
+            continue
+        buckets.setdefault(month, {"swim": 0.0, "bike": 0.0, "run": 0.0})
+        buckets[month][sport] += float(a.get("distance") or 0) / 1000.0
+
+    return {mo: {k: round(v, 1) for k, v in vals.items()} for mo, vals in sorted(buckets.items())}
+
+
 def _login(payload: dict[str, Any]) -> dict[str, Any]:
     from garminconnect import (
         Garmin,
@@ -138,6 +179,7 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
                 "recent_activities": m._compress_activities(
                     gde.collect_activities(api, end)
                 ),
+                "monthly_distances": _monthly_distances(api, end),
             }
         except Exception as e:  # noqa: BLE001 - always return JSON to the caller
             return {"status": "error", "message": f"Sync failed: {e!r}"}
