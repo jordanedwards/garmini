@@ -124,6 +124,179 @@ def _training_readiness(api: Any, end: Any) -> dict[str, Any] | None:
     }
 
 
+_SPORTS = {
+    "run": (1, "running"), "running": (1, "running"),
+    "bike": (2, "cycling"), "cycling": (2, "cycling"), "ride": (2, "cycling"),
+    "swim": (4, "swimming"), "swimming": (4, "swimming"),
+}
+_STEP_TYPES = {
+    "warmup": (1, "warmup", 1), "cooldown": (2, "cooldown", 2),
+    "interval": (3, "interval", 3), "active": (3, "interval", 3), "main": (3, "interval", 3),
+    "recovery": (4, "recovery", 4), "rest": (5, "rest", 5),
+}
+
+
+def _wk_step_type(kind: str) -> dict[str, Any]:
+    tid, key, order = _STEP_TYPES.get(kind, (3, "interval", 3))
+    return {"stepTypeId": tid, "stepTypeKey": key, "displayOrder": order}
+
+
+def _wk_end(step: dict[str, Any]) -> dict[str, Any]:
+    end = (step.get("end") or "lap_button").lower()
+    if end == "time":
+        return {"endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True}, "endConditionValue": float(step.get("value") or 0)}
+    if end == "distance":
+        return {"endCondition": {"conditionTypeId": 3, "conditionTypeKey": "distance", "displayOrder": 3, "displayable": True}, "endConditionValue": float(step.get("value") or 0)}
+    return {"endCondition": {"conditionTypeId": 1, "conditionTypeKey": "lap.button", "displayOrder": 1, "displayable": True}}
+
+
+def _wk_target(step: dict[str, Any]) -> dict[str, Any]:
+    target = (step.get("target") or "none").lower()
+    low, high = step.get("low") or 0, step.get("high") or 0
+    types = {
+        "hr": (4, "heart.rate.zone"), "power": (2, "power.zone"),
+        "pace": (6, "pace.zone"), "cadence": (3, "cadence"),
+    }
+    if target not in types or not (low or high):
+        return {"targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1}}
+
+    tid, key = types[target]
+    out: dict[str, Any] = {"targetType": {"workoutTargetTypeId": tid, "workoutTargetTypeKey": key, "displayOrder": 1}}
+    if target == "pace":
+        # coach gives seconds/km; Garmin wants speed (m/s): one=slower, two=faster.
+        out["targetValueOne"] = round(1000.0 / high, 4) if high else 0
+        out["targetValueTwo"] = round(1000.0 / low, 4) if low else 0
+    else:
+        out["targetValueOne"], out["targetValueTwo"] = float(low), float(high)
+    return out
+
+
+def _build_workout_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    order = {"n": 0}
+
+    def make(step: dict[str, Any]) -> dict[str, Any]:
+        order["n"] += 1
+        so = order["n"]
+        kind = (step.get("kind") or "active").lower()
+        if kind == "repeat":
+            children = [make(c) for c in (step.get("steps") or [])]
+            iters = int(step.get("iterations") or 1)
+            return {
+                "type": "RepeatGroupDTO", "stepOrder": so,
+                "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
+                "numberOfIterations": iters, "workoutSteps": children,
+                "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations", "displayOrder": 7, "displayable": False},
+                "endConditionValue": float(iters), "smartRepeat": False,
+            }
+        d: dict[str, Any] = {"type": "ExecutableStepDTO", "stepOrder": so, "stepType": _wk_step_type(kind)}
+        d.update(_wk_end(step))
+        d.update(_wk_target(step))
+        note = (step.get("note") or "").strip()
+        if note:
+            d["description"] = note[:512]
+        return d
+
+    return [make(s) for s in steps]
+
+
+def _push_workouts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build structured workouts from the plan and schedule them on the watch."""
+    tokens_blob = payload.get("tokens")
+    if not tokens_blob:
+        return {"status": "error", "message": "No tokens provided."}
+    try:
+        files = json.loads(tokens_blob)
+    except ValueError:
+        return {"status": "error", "message": "Invalid tokens blob."}
+
+    sessions = payload.get("sessions") or []
+    prefix = payload.get("name_prefix") or "Garmini: "
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokenstore = Path(tmp)
+        for name, content in files.items():
+            fp = tokenstore / name
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content)
+        try:
+            from garminconnect import Garmin
+
+            api = Garmin()
+            api.login(str(tokenstore))
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "message": f"Garmin login failed: {e!r}"}
+
+        target_dates = {s.get("date") for s in sessions if s.get("date")}
+
+        # Idempotency: remove our previously-scheduled workouts on those dates,
+        # plus any explicit prior workout ids passed in.
+        _cleanup_pushed(api, sessions, target_dates, prefix)
+
+        pushed, skipped = [], []
+        for s in sessions:
+            date = s.get("date")
+            sport = _SPORTS.get((s.get("discipline") or "").lower())
+            steps = s.get("steps") or []
+            if not date or not sport or not steps:
+                skipped.append({"date": date, "reason": "unsupported or no steps"})
+                continue
+            sport_type = {"sportTypeId": sport[0], "sportTypeKey": sport[1]}
+            workout = {
+                "workoutName": (prefix + (s.get("title") or "Workout"))[:80],
+                "description": (s.get("description") or "")[:1024] or None,
+                "sportType": sport_type,
+                "workoutSegments": [{
+                    "segmentOrder": 1, "sportType": sport_type,
+                    "workoutSteps": _build_workout_steps(steps),
+                }],
+            }
+            try:
+                res = api.upload_workout(workout)
+                wid = res.get("workoutId") or (res.get("workout") or {}).get("workoutId")
+                if wid:
+                    api.schedule_workout(wid, date)
+                pushed.append({"date": date, "discipline": s.get("discipline"), "workout_id": wid})
+            except Exception as e:  # noqa: BLE001
+                skipped.append({"date": date, "reason": repr(e)})
+
+        return {"status": "ok", "pushed": pushed, "skipped": skipped}
+
+
+def _cleanup_pushed(api: Any, sessions: list[dict[str, Any]], target_dates: set, prefix: str) -> None:
+    # Delete explicitly-known prior workouts.
+    for s in sessions:
+        wid = s.get("existing_workout_id")
+        if wid:
+            try:
+                api.delete_workout(wid)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Best-effort: remove our prefixed workouts already scheduled on those dates.
+    months = {(int(d[:4]), int(d[5:7])) for d in target_dates if d and len(d) >= 7}
+    for (year, month) in months:
+        try:
+            scheduled = api.get_scheduled_workouts(year, month) or []
+        except Exception:  # noqa: BLE001
+            continue
+        for entry in scheduled if isinstance(scheduled, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            wo = entry.get("workout") or entry
+            wname = str(wo.get("workoutName") or "")
+            edate = str(entry.get("date") or entry.get("scheduledDate") or wo.get("scheduledDate") or "")[:10]
+            if edate in target_dates and wname.startswith(prefix):
+                sid = entry.get("scheduleId") or entry.get("id")
+                wid = wo.get("workoutId") or entry.get("workoutId")
+                try:
+                    if sid:
+                        api.unschedule_workout(sid)
+                    if wid:
+                        api.delete_workout(wid)
+                except Exception:  # noqa: BLE001
+                    pass
+
+
 def _login(payload: dict[str, Any]) -> dict[str, Any]:
     from garminconnect import (
         Garmin,
@@ -401,6 +574,7 @@ ACTIONS = {
     "predict_races": _predict_races,
     "resolve_location": _resolve_location,
     "translate": _translate,
+    "push_workouts": _push_workouts,
     "chat": _chat,
 }
 

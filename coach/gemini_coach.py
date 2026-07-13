@@ -20,11 +20,34 @@ class CalendarOp(BaseModel):
     event_id: str = ""  # only for update/delete
 
 
+class WorkoutStep(BaseModel):
+    """One step of a structured workout (or a repeat group).
+
+    For a normal step: set `kind`, `end` + `value`, and optionally a target.
+    For a repeat block: set kind="repeat", `iterations`, and `steps` (children).
+    Units: value = seconds when end="time", metres when end="distance".
+    Targets — hr: bpm, power: watts, pace: seconds per kilometre, cadence: spm/rpm.
+    """
+
+    kind: str  # warmup | active | interval | recovery | cooldown | rest | repeat
+    end: str = "lap_button"  # time | distance | lap_button
+    value: float = 0  # seconds (time) or metres (distance)
+    target: str = "none"  # none | hr | power | pace | cadence
+    low: float = 0
+    high: float = 0
+    note: str = ""
+    iterations: int = 0  # for kind="repeat"
+    steps: list[WorkoutStep] = []  # for kind="repeat"
+
+
 class DailySession(BaseModel):
     date: str  # YYYY-MM-DD
     discipline: str  # swim | bike | run | brick | strength | rest | other
     title: str
     description: str
+    # Structured steps for run/bike/swim so the session can be pushed to the
+    # watch. Optional — omit (empty) for rest/strength/unstructured days.
+    steps: list[WorkoutStep] = []
 
 
 class CoachOutput(BaseModel):
@@ -33,6 +56,10 @@ class CoachOutput(BaseModel):
     updated_plan_markdown: str
     daily_sessions: list[DailySession]  # the next ~14 days, one entry per day
     calendar_ops: list[CalendarOp]
+
+
+# Resolve the self-referential WorkoutStep.steps forward reference.
+WorkoutStep.model_rebuild()
 
 
 def run_coach(
