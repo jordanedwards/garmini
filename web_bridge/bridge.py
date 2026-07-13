@@ -83,6 +83,22 @@ def _monthly_distances(api: Any, end: Any, months: int = 6) -> dict[str, Any]:
     return {mo: {k: round(v, 1) for k, v in vals.items()} for mo, vals in sorted(buckets.items())}
 
 
+def _devices(api: Any) -> list[dict[str, Any]]:
+    """The athlete's registered Garmin devices: [{name, unit_id}, ...]."""
+    try:
+        devices = api.get_devices() or []
+    except Exception:  # noqa: BLE001
+        return []
+
+    out = []
+    for d in devices:
+        name = d.get("productDisplayName") or d.get("displayName") or d.get("productName")
+        unit = d.get("deviceId") or d.get("unitId") or d.get("serialNumber")
+        if name and unit is not None:
+            out.append({"name": str(name).strip(), "unit_id": str(unit)})
+    return out
+
+
 def _training_readiness(api: Any, end: Any) -> dict[str, Any] | None:
     """Latest Training Readiness snapshot (score 0-100 + level + feedback)."""
     try:
@@ -206,6 +222,7 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "monthly_distances": _monthly_distances(api, end),
                 "training_readiness": _training_readiness(api, end),
+                "devices": _devices(api),
             }
         except Exception as e:  # noqa: BLE001 - always return JSON to the caller
             return {"status": "error", "message": f"Sync failed: {e!r}"}
