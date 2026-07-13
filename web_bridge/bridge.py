@@ -238,7 +238,7 @@ def _push_workouts(payload: dict[str, Any]) -> dict[str, Any]:
             sport = _SPORTS.get((s.get("discipline") or "").lower())
             steps = s.get("steps") or []
             if not date or not sport or not steps:
-                skipped.append({"date": date, "reason": "unsupported or no steps"})
+                skipped.append({"ref": s.get("ref"), "date": date, "reason": "unsupported or no steps"})
                 continue
             sport_type = {"sportTypeId": sport[0], "sportTypeKey": sport[1]}
             workout = {
@@ -255,9 +255,9 @@ def _push_workouts(payload: dict[str, Any]) -> dict[str, Any]:
                 wid = res.get("workoutId") or (res.get("workout") or {}).get("workoutId")
                 if wid:
                     api.schedule_workout(wid, date)
-                pushed.append({"date": date, "discipline": s.get("discipline"), "workout_id": wid})
+                pushed.append({"ref": s.get("ref"), "date": date, "discipline": s.get("discipline"), "workout_id": wid})
             except Exception as e:  # noqa: BLE001
-                skipped.append({"date": date, "reason": repr(e)})
+                skipped.append({"ref": s.get("ref"), "date": date, "reason": repr(e)})
 
         return {"status": "ok", "pushed": pushed, "skipped": skipped}
 
