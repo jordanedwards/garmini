@@ -273,25 +273,26 @@ def _cleanup_pushed(api: Any, sessions: list[dict[str, Any]], target_dates: set,
                 pass
 
     # Best-effort: remove our prefixed workouts already scheduled on those dates.
+    # get_scheduled_workouts returns a month calendar: {"calendarItems": [...]},
+    # where workout entries have itemType=="workout", a "title" (carrying our
+    # prefix), a "date", a schedule "id", and the "workoutId".
     months = {(int(d[:4]), int(d[5:7])) for d in target_dates if d and len(d) >= 7}
     for (year, month) in months:
         try:
-            scheduled = api.get_scheduled_workouts(year, month) or []
+            resp = api.get_scheduled_workouts(year, month) or {}
         except Exception:  # noqa: BLE001
             continue
-        for entry in scheduled if isinstance(scheduled, list) else []:
-            if not isinstance(entry, dict):
+        items = resp.get("calendarItems") if isinstance(resp, dict) else resp
+        for entry in items or []:
+            if not isinstance(entry, dict) or str(entry.get("itemType")) != "workout":
                 continue
-            wo = entry.get("workout") or entry
-            wname = str(wo.get("workoutName") or "")
-            edate = str(entry.get("date") or entry.get("scheduledDate") or wo.get("scheduledDate") or "")[:10]
-            if edate in target_dates and wname.startswith(prefix):
-                sid = entry.get("scheduleId") or entry.get("id")
-                wid = wo.get("workoutId") or entry.get("workoutId")
+            title = str(entry.get("title") or "")
+            edate = str(entry.get("date") or "")[:10]
+            if edate in target_dates and title.startswith(prefix):
+                wid = entry.get("workoutId")
                 try:
-                    if sid:
-                        api.unschedule_workout(sid)
                     if wid:
+                        # Deleting the workout also removes its calendar schedule.
                         api.delete_workout(wid)
                 except Exception:  # noqa: BLE001
                     pass
