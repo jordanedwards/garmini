@@ -124,6 +124,55 @@ def _training_readiness(api: Any, end: Any) -> dict[str, Any] | None:
     }
 
 
+def _body_battery(api: Any, end: Any) -> dict[str, Any] | None:
+    """Most recent Body Battery reading: current level plus the day's range
+    and how much it charged/drained."""
+    from datetime import timedelta
+
+    try:
+        start = (end - timedelta(days=1)).isoformat()
+        data = api.get_body_battery(start, end.isoformat())
+    except Exception:  # noqa: BLE001
+        return None
+
+    days = [d for d in (data or []) if isinstance(d, dict)]
+    if not days:
+        return None
+
+    # Prefer the most recent day that actually has readings.
+    day = next(
+        (d for d in sorted(days, key=lambda x: x.get("date") or "", reverse=True)
+         if d.get("bodyBatteryValuesArray")),
+        days[-1],
+    )
+
+    levels: list[int] = []
+    for v in day.get("bodyBatteryValuesArray") or []:
+        lvl = None
+        if isinstance(v, (list, tuple)):
+            # Entries look like [epochMillis, level] (sometimes with a status in
+            # between); the level is the 0-100 value, the epoch is a huge number.
+            for x in v:
+                if isinstance(x, (int, float)) and 0 <= x <= 100:
+                    lvl = x
+        elif isinstance(v, dict):
+            lvl = v.get("bodyBatteryLevel") or v.get("level") or v.get("value")
+        if isinstance(lvl, (int, float)) and 0 <= lvl <= 100:
+            levels.append(int(lvl))
+
+    if not levels and day.get("charged") is None and day.get("drained") is None:
+        return None
+
+    return {
+        "current": levels[-1] if levels else None,
+        "high": max(levels) if levels else None,
+        "low": min(levels) if levels else None,
+        "charged": day.get("charged"),
+        "drained": day.get("drained"),
+        "date": day.get("date"),
+    }
+
+
 _SPORTS = {
     "run": (1, "running"), "running": (1, "running"),
     "bike": (2, "cycling"), "cycling": (2, "cycling"), "ride": (2, "cycling"),
@@ -396,6 +445,7 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "monthly_distances": _monthly_distances(api, end),
                 "training_readiness": _training_readiness(api, end),
+                "body_battery": _body_battery(api, end),
                 "devices": _devices(api),
             }
         except Exception as e:  # noqa: BLE001 - always return JSON to the caller
