@@ -23,6 +23,7 @@ import json
 import logging
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -454,6 +455,136 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "connected", "metrics": bundle}
 
 
+def _extract_activity(detail: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one get_activity() blob into a flat record + keep the full raw
+    summary so no stat is ever lost for the deep-analysis tool."""
+    summ = detail.get("summaryDTO") or {}
+    atype = (detail.get("activityTypeDTO") or {}).get("typeKey")
+    meta = detail.get("metadataDTO") or {}
+    tz = detail.get("timeZoneUnitDTO") or {}
+
+    def g(*keys: str) -> Any:
+        for k in keys:
+            v = summ.get(k)
+            if v is not None:
+                return v
+        return None
+
+    return {
+        "garmin_activity_id": detail.get("activityId"),
+        "sport": _sport_bucket(atype),
+        "activity_type": atype,
+        "activity_name": detail.get("activityName"),
+        "start_time_local": summ.get("startTimeLocal"),
+        "start_time_gmt": summ.get("startTimeGMT"),
+        "start_timezone": tz.get("timeZone") or tz.get("unitKey"),
+        # Links this activity back to a pushed structured workout, when present.
+        "workout_id": meta.get("associatedWorkoutId"),
+        "is_multisport_parent": bool(detail.get("isMultiSportParent")),
+        # Headline stats (everything else lives in `summary`).
+        "distance": g("distance"),
+        "duration": g("duration"),
+        "moving_duration": g("movingDuration"),
+        "elevation_gain": g("elevationGain"),
+        "average_hr": g("averageHR"),
+        "max_hr": g("maxHR"),
+        "calories": g("calories"),
+        "average_speed": g("averageSpeed"),
+        "max_speed": g("maxSpeed"),
+        "average_power": g("averagePower"),
+        "norm_power": g("normalizedPower"),
+        "average_cadence": g("averageRunCadence", "averageBikeCadence", "averageSwimCadence"),
+        "aerobic_training_effect": g("trainingEffect"),
+        "anaerobic_training_effect": g("anaerobicTrainingEffect"),
+        "activity_training_load": g("activityTrainingLoad"),
+        # Garmin's post-workout "Execution score" (workout compliance, 0-100);
+        # only present for activities done from a followed structured workout.
+        "execution_score": g("directWorkoutComplianceScore"),
+        "summary": detail,
+    }
+
+
+def _activities(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fetch full per-activity detail for recent run/bike/swim activities.
+
+    Payload: {tokens, days=7, limit=50, start_date?, end_date?, include_splits?}
+    """
+    tokens_blob = payload.get("tokens")
+    if not tokens_blob:
+        return {"status": "error", "message": "No tokens provided."}
+    try:
+        files = json.loads(tokens_blob)
+    except ValueError:
+        return {"status": "error", "message": "Invalid tokens blob."}
+
+    from datetime import date, timedelta
+
+    limit = int(payload.get("limit") or 50)
+    include_splits = bool(payload.get("include_splits"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokenstore = Path(tmp)
+        for name, content in files.items():
+            fp = tokenstore / name
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content)
+        try:
+            from garminconnect import Garmin
+
+            api = Garmin()
+            api.login(str(tokenstore))  # restore session; no credentials/MFA
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "message": f"Garmin login failed: {e!r}"}
+
+        end_s = payload.get("end_date") or date.today().isoformat()
+        if payload.get("start_date"):
+            start_s = str(payload["start_date"])
+        else:
+            days = int(payload.get("days") or 7)
+            start_s = (date.fromisoformat(end_s) - timedelta(days=days - 1)).isoformat()
+
+        try:
+            summaries = api.get_activities_by_date(start_s, end_s) or []
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "message": f"Activity list failed: {e!r}"}
+
+        # Keep only run/bike/swim, newest first, bounded by limit.
+        wanted = [
+            s for s in summaries
+            if isinstance(s, dict)
+            and _sport_bucket((s.get("activityType") or {}).get("typeKey"))
+        ][:limit]
+
+        activities = []
+        for s in wanted:
+            aid = s.get("activityId")
+            if not aid:
+                continue
+            try:
+                detail = api.get_activity(str(aid))
+            except Exception:  # noqa: BLE001 - one bad activity can't kill the batch
+                continue
+            detail.pop("userRoles", None)
+            rec = _extract_activity(detail)
+            if not rec.get("sport"):
+                continue
+            rec["parent_id"] = s.get("parentId")
+            if include_splits:
+                try:
+                    rec["splits"] = api.get_activity_typed_splits(str(aid))
+                except Exception:  # noqa: BLE001
+                    rec["splits"] = None
+            activities.append(rec)
+            time.sleep(0.2)  # be gentle on the Garmin API across many detail calls
+
+        return {
+            "status": "connected",
+            "window": {"start": start_s, "end": end_s},
+            "count": len(activities),
+            "activities": activities,
+        }
+
+
 def _refresh_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """Ask Gemini (as coach) to revise the season plan from the user's context."""
     api_key = payload.get("api_key")
@@ -620,6 +751,7 @@ def _chat(payload: dict[str, Any]) -> dict[str, Any]:
 ACTIONS = {
     "login": _login,
     "sync": _sync,
+    "activities": _activities,
     "refresh_plan": _refresh_plan,
     "motivate": _motivate,
     "predict_races": _predict_races,
