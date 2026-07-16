@@ -136,7 +136,11 @@ def predict_races(
         "For each race, predict realistic swim, bike and run split times and the overall finish "
         "time. Base it on the athlete's current fitness (FTP, VO2 max, threshold pace/HR, recent "
         "activities) and the race's distance and terrain (use the location/notes for hills, "
-        "altitude, water, etc.). Include transitions in the overall time. Format times as H:MM:SS "
+        "altitude, water, etc.). When a race includes a course_profile (terrain, swim, typical "
+        "conditions, difficulty, previous years' results), calibrate the prediction to THAT "
+        "course — the same athlete can be many minutes slower on a hilly, rough-water course "
+        "than on a fast flat one, and prior-year results anchor what realistic times look like. "
+        "Include transitions in the overall time. Format times as H:MM:SS "
         "(or M:SS for short swims). Give a one-sentence rationale. Return exactly one entry per "
         "race, echoing its race_id."
     )
@@ -266,6 +270,105 @@ def motivate(
         ),
     )
     return (response.text or "").strip()
+
+
+class RaceProfileOffering(BaseModel):
+    event: str  # e.g. "sprint", "Standard Aquabike", "Road Bike Race"
+    total_km: float = 0
+    swim_km: float = 0
+    bike_km: float = 0
+    run_km: float = 0
+
+
+class RaceProfile(BaseModel):
+    summary: str  # 1-2 sentences on what this race is
+    offerings: list[RaceProfileOffering] = []
+    course: str  # terrain character: hilly climb vs fast and flat, elevation gain, technical?
+    swim: str = ""  # open water type (lake/ocean/river), currents, typical temp, wetsuit legality
+    conditions: str  # typical race-day weather: heat, wind, chop
+    difficulty: str  # easy | moderate | hard | extreme — with a short justification
+    challenges: list[str] = []  # the race's unique challenges, most important first
+    results_notes: str = ""  # what prior-year results suggest (typical finish times, DNF rates)
+    sources: list[str] = []  # URLs the profile is based on
+
+
+def profile_race(
+    *,
+    api_key: str,
+    model: str,
+    race_json: str,
+) -> RaceProfile:
+    """Research a race (web search + its website) and return a structured profile.
+
+    Two calls: Gemini's search grounding can't be combined with a response
+    schema, so we research free-form first, then extract the structured
+    profile from the research notes.
+    """
+    client = genai.Client(api_key=api_key)
+
+    research_prompt = (
+        "You are researching a race for a triathlon coaching app.\n\n"
+        f"=== RACE (JSON) ===\n{race_json}\n\n"
+        "Using web search (and the race's website if given), write research notes covering:\n"
+        "1. What the race is and the events/distances it offers.\n"
+        "2. The bike/run course character — hilly climb or fast and flat? Elevation gain, "
+        "technical descents, road surface.\n"
+        "3. The swim, if any — lake, ocean or river; currents/chop; typical water temperature "
+        "and wetsuit legality.\n"
+        "4. Typical race-day conditions (heat, wind).\n"
+        "5. Overall difficulty and the race's unique challenges.\n"
+        "6. Previous years' results if findable (e.g. on startlinetiming.com, zone4.ca or the "
+        "race website): typical/median finish times per event, so a coach can calibrate an "
+        "athlete's expectations for THIS course.\n"
+        "List the URLs you used. If you can't find the race, say so plainly — do not invent "
+        "details."
+    )
+
+    research = client.models.generate_content(
+        model=model,
+        contents=research_prompt,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            temperature=0.2,
+        ),
+    )
+    notes = (research.text or "").strip()
+    if not notes:
+        raise ValueError("Race research returned no notes.")
+
+    # Grounding URLs, when the SDK exposes them.
+    urls: list[str] = []
+    for cand in getattr(research, "candidates", None) or []:
+        meta = getattr(cand, "grounding_metadata", None)
+        for chunk in getattr(meta, "grounding_chunks", None) or []:
+            uri = getattr(getattr(chunk, "web", None), "uri", None)
+            if uri:
+                urls.append(uri)
+
+    extract = client.models.generate_content(
+        model=model,
+        contents=(
+            f"=== RACE (JSON) ===\n{race_json}\n\n"
+            f"=== RESEARCH NOTES ===\n{notes}\n\n"
+            "Distil the research notes into the race profile. Only state what the notes "
+            "support; leave fields empty rather than guessing. Keep every field concise — "
+            "this is shown on a small card and fed to a coach prompt."
+        ),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=RaceProfile,
+            temperature=0.1,
+        ),
+    )
+
+    parsed = getattr(extract, "parsed", None)
+    profile = (
+        parsed
+        if isinstance(parsed, RaceProfile)
+        else RaceProfile.model_validate(json.loads(extract.text or "{}"))
+    )
+    profile.sources = list(dict.fromkeys([*profile.sources, *urls]))[:8]
+    return profile
 
 
 def chat_reply(

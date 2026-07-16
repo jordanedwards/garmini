@@ -723,6 +723,30 @@ def _motivate(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "text": text}
 
 
+def _profile_race(payload: dict[str, Any]) -> dict[str, Any]:
+    """Research a race (search-grounded Gemini) into a structured course profile."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    race = payload.get("race") or {}
+    if not race.get("name"):
+        return {"status": "error", "message": "No race name provided."}
+
+    try:
+        from coach.gemini_coach import profile_race
+
+        out = profile_race(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            race_json=json.dumps(race),
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Race profiling failed: {e!r}"}
+
+    return {"status": "ok", "profile": out.model_dump()}
+
+
 def _chat(payload: dict[str, Any]) -> dict[str, Any]:
     """Free-form coach chat reply."""
     api_key = payload.get("api_key")
@@ -755,6 +779,7 @@ ACTIONS = {
     "refresh_plan": _refresh_plan,
     "motivate": _motivate,
     "predict_races": _predict_races,
+    "profile_race": _profile_race,
     "resolve_location": _resolve_location,
     "translate": _translate,
     "push_workouts": _push_workouts,
