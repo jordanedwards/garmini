@@ -190,6 +190,24 @@ def _training_status(api: Any, end: Any) -> dict[str, Any] | None:
     }
 
 
+def _bb_levels(day: dict[str, Any]) -> list[int]:
+    """Extract the 0-100 Body Battery readings from one day's payload."""
+    levels: list[int] = []
+    for v in day.get("bodyBatteryValuesArray") or []:
+        lvl = None
+        if isinstance(v, (list, tuple)):
+            # Entries look like [epochMillis, level] (sometimes with a status in
+            # between); the level is the 0-100 value, the epoch is a huge number.
+            for x in v:
+                if isinstance(x, (int, float)) and 0 <= x <= 100:
+                    lvl = x
+        elif isinstance(v, dict):
+            lvl = v.get("bodyBatteryLevel") or v.get("level") or v.get("value")
+        if isinstance(lvl, (int, float)) and 0 <= lvl <= 100:
+            levels.append(int(lvl))
+    return levels
+
+
 def _body_battery(api: Any, end: Any) -> dict[str, Any] | None:
     """Most recent Body Battery reading: current level plus the day's range
     and how much it charged/drained."""
@@ -212,19 +230,7 @@ def _body_battery(api: Any, end: Any) -> dict[str, Any] | None:
         days[-1],
     )
 
-    levels: list[int] = []
-    for v in day.get("bodyBatteryValuesArray") or []:
-        lvl = None
-        if isinstance(v, (list, tuple)):
-            # Entries look like [epochMillis, level] (sometimes with a status in
-            # between); the level is the 0-100 value, the epoch is a huge number.
-            for x in v:
-                if isinstance(x, (int, float)) and 0 <= x <= 100:
-                    lvl = x
-        elif isinstance(v, dict):
-            lvl = v.get("bodyBatteryLevel") or v.get("level") or v.get("value")
-        if isinstance(lvl, (int, float)) and 0 <= lvl <= 100:
-            levels.append(int(lvl))
+    levels = _bb_levels(day)
 
     if not levels and day.get("charged") is None and day.get("drained") is None:
         return None
@@ -237,6 +243,54 @@ def _body_battery(api: Any, end: Any) -> dict[str, Any] | None:
         "drained": day.get("drained"),
         "date": day.get("date"),
     }
+
+
+def _body_battery_4week(api: Any, end: Any) -> list[dict[str, Any]]:
+    """Daily Body Battery high/low over the last 4 weeks (one range call)."""
+    from datetime import timedelta
+
+    try:
+        start = (end - timedelta(days=27)).isoformat()
+        data = api.get_body_battery(start, end.isoformat())
+    except Exception:  # noqa: BLE001
+        return []
+
+    out = []
+    days = sorted(
+        (d for d in (data or []) if isinstance(d, dict)),
+        key=lambda x: x.get("date") or "",
+    )
+    for day in days:
+        levels = _bb_levels(day)
+        if levels:
+            out.append({"date": day.get("date"), "high": max(levels), "low": min(levels)})
+    return out
+
+
+def _training_readiness_4week(api: Any, end: Any) -> list[dict[str, Any]]:
+    """Daily Training Readiness score over the last 4 weeks."""
+    from datetime import timedelta
+
+    out = []
+    for i in range(27, -1, -1):
+        d = (end - timedelta(days=i)).isoformat()
+        try:
+            data = api.get_training_readiness(d)
+        except Exception:  # noqa: BLE001
+            continue
+
+        entries = [data] if isinstance(data, dict) else (data or [])
+        entries = [e for e in entries if isinstance(e, dict) and e.get("score") is not None]
+        if not entries:
+            continue
+
+        entry = max(entries, key=lambda e: e.get("timestamp") or e.get("calendarDate") or "")
+        out.append({
+            "date": entry.get("calendarDate") or d,
+            "score": entry.get("score"),
+            "level": entry.get("level"),
+        })
+    return out
 
 
 _SPORTS = {
@@ -511,8 +565,10 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "monthly_distances": _monthly_distances(api, end),
                 "training_readiness": _training_readiness(api, end),
+                "training_readiness_4week": _training_readiness_4week(api, end),
                 "training_status": _training_status(api, end),
                 "body_battery": _body_battery(api, end),
+                "body_battery_4week": _body_battery_4week(api, end),
                 "devices": _devices(api),
             }
         except Exception as e:  # noqa: BLE001 - always return JSON to the caller
