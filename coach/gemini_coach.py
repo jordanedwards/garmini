@@ -375,6 +375,73 @@ def profile_race(
     return profile
 
 
+class DeepAnalysisFinding(BaseModel):
+    dimension: str  # e.g. "Vertical oscillation", "Cadence", "Pacing discipline"
+    severity: str  # strength | minor | notable | priority
+    observation: str  # what the data shows, citing the athlete's numbers
+    why_it_matters: str  # the efficiency/performance cost
+    technique_cues: list[str] = []  # concrete form changes to make
+    drills: list[str] = []  # drills/workouts that address it
+
+
+class DeepAnalysisReport(BaseModel):
+    sport: str
+    summary: str  # 2-4 sentence overview
+    strengths: list[str] = []
+    findings: list[DeepAnalysisFinding] = []
+    focus_next: list[str] = []  # the few highest-impact things to work on next
+
+
+def deep_analysis(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    sport: str,
+    activities_json: str,
+    today: str,
+) -> DeepAnalysisReport:
+    """Analyse an athlete's recent history in one sport for technique and
+    efficiency issues, and prescribe fixes.
+    """
+    client = genai.Client(api_key=api_key)
+
+    user_content = (
+        f"Today's date: {today}.\n\n"
+        f"Perform a DEEP ANALYSIS of this athlete's {sport}.\n\n"
+        f"=== RECENT {sport.upper()} ACTIVITIES (JSON, one row per session) ===\n"
+        f"{activities_json}\n\n"
+        "Examine the history for efficiency losses, technique flaws, weaknesses and "
+        "inefficiencies. Look at trends and consistency, not just averages. Cite the "
+        "athlete's actual numbers. For running, scrutinise vertical oscillation and "
+        "vertical ratio (bounciness wastes energy), ground contact time and its L/R "
+        "balance, cadence and stride length; for cycling, power distribution, "
+        "normalized vs average power, cadence and any L/R imbalance; for swimming, "
+        "SWOLF, stroke rate and distance per stroke. Only reason about metrics that are "
+        "present in the data — never invent values. For each issue give the observation, "
+        "why it matters, concrete technique cues, and specific drills. Rank findings by "
+        "severity (priority/notable/minor) and call out genuine strengths too. Finish "
+        "with the few highest-impact things to focus on next."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=DeepAnalysisReport,
+            temperature=0.3,
+        ),
+    )
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, DeepAnalysisReport):
+        return parsed
+    data: dict[str, Any] = json.loads(response.text or "{}")
+    return DeepAnalysisReport.model_validate(data)
+
+
 def chat_reply(
     *,
     api_key: str,

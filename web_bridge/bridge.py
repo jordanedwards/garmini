@@ -869,6 +869,31 @@ def _profile_race(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "profile": out.model_dump()}
 
 
+def _deep_analysis(payload: dict[str, Any]) -> dict[str, Any]:
+    """Deep-analyse one sport's recent history for technique/efficiency issues."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    from datetime import date
+
+    try:
+        from coach.gemini_coach import deep_analysis
+
+        out = deep_analysis(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            sport=payload.get("sport") or "",
+            activities_json=json.dumps(payload.get("activities") or []),
+            today=payload.get("today") or date.today().isoformat(),
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Deep analysis failed: {e!r}"}
+
+    return {"status": "ok", "report": out.model_dump()}
+
+
 def _chat(payload: dict[str, Any]) -> dict[str, Any]:
     """Free-form coach chat reply."""
     api_key = payload.get("api_key")
@@ -902,6 +927,7 @@ ACTIONS = {
     "motivate": _motivate,
     "predict_races": _predict_races,
     "profile_race": _profile_race,
+    "deep_analysis": _deep_analysis,
     "resolve_location": _resolve_location,
     "translate": _translate,
     "push_workouts": _push_workouts,
