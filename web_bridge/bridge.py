@@ -125,6 +125,71 @@ def _training_readiness(api: Any, end: Any) -> dict[str, Any] | None:
     }
 
 
+# Garmin's training-status vocabulary. The feedback phrase (e.g. "PEAKING_1")
+# is the reliable source; the numeric code is a last-resort fallback.
+_TRAINING_STATUS_WORDS = [
+    "PEAKING", "PRODUCTIVE", "MAINTAINING", "RECOVERY", "UNPRODUCTIVE",
+    "DETRAINING", "OVERREACHING", "STRAINED", "NO_STATUS",
+]
+_TRAINING_STATUS_CODES = {
+    1: "DETRAINING", 2: "RECOVERY", 3: "MAINTAINING", 4: "PRODUCTIVE",
+    5: "PEAKING", 6: "OVERREACHING", 7: "UNPRODUCTIVE",
+}
+
+
+def _training_status_word(phrase: Any, code: Any) -> str | None:
+    """Resolve a canonical status word from the feedback phrase, or the code."""
+    if isinstance(phrase, str):
+        up = phrase.upper()
+        for word in _TRAINING_STATUS_WORDS:
+            if word in up:
+                return word
+    if isinstance(code, (int, float)):
+        return _TRAINING_STATUS_CODES.get(int(code))
+    return None
+
+
+def _training_status(api: Any, end: Any) -> dict[str, Any] | None:
+    """Garmin Training Status: the label (peaking/productive/maintaining/…),
+    Garmin's feedback phrase, and when the current status began."""
+    try:
+        data = api.get_training_status(end.isoformat())
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    latest = (data.get("mostRecentTrainingStatus") or {}).get(
+        "latestTrainingStatusData"
+    ) or {}
+    if not isinstance(latest, dict):
+        return None
+
+    # Multiple devices can report; keep the most recently-dated entry.
+    best: dict[str, Any] | None = None
+    for dev in latest.values():
+        if not isinstance(dev, dict):
+            continue
+        if best is None or (dev.get("calendarDate") or "") > (best.get("calendarDate") or ""):
+            best = dev
+
+    if not best:
+        return None
+
+    phrase = best.get("trainingStatusFeedbackPhrase")
+    code = best.get("trainingStatus")
+    word = _training_status_word(phrase, code)
+    if not word:
+        return None
+
+    return {
+        "status": word,
+        "phrase": phrase,
+        "since": best.get("sinceDate") or best.get("calendarDate"),
+    }
+
+
 def _body_battery(api: Any, end: Any) -> dict[str, Any] | None:
     """Most recent Body Battery reading: current level plus the day's range
     and how much it charged/drained."""
@@ -446,6 +511,7 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "monthly_distances": _monthly_distances(api, end),
                 "training_readiness": _training_readiness(api, end),
+                "training_status": _training_status(api, end),
                 "body_battery": _body_battery(api, end),
                 "devices": _devices(api),
             }
