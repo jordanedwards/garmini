@@ -105,7 +105,8 @@ class RacePrediction(BaseModel):
     swim: str  # H:MM:SS or M:SS
     bike: str
     run: str
-    overall: str  # includes transitions
+    overall: str  # elapsed: swim + bike + run, NO transitions
+    official: str = ""  # official/chip time: elapsed + realistic T1/T2 transitions
     rationale: str  # one sentence
 
 
@@ -140,7 +141,10 @@ def predict_races(
         "conditions, difficulty, previous years' results), calibrate the prediction to THAT "
         "course — the same athlete can be many minutes slower on a hilly, rough-water course "
         "than on a fast flat one, and prior-year results anchor what realistic times look like. "
-        "Include transitions in the overall time. Format times as H:MM:SS "
+        "Report two totals: `overall` is the ELAPSED time — the sum of the swim, bike and run "
+        "splits with no transitions — and `official` is the official/chip time: elapsed plus "
+        "realistic T1 and T2 transitions for this race's size and transition-area layout "
+        "(typically 1:30–3:00 each; longer for big or spread-out venues). Format times as H:MM:SS "
         "(or M:SS for short swims). Give a one-sentence rationale. Return exactly one entry per "
         "race, echoing its race_id."
     )
