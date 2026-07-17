@@ -446,9 +446,11 @@ def deep_analysis(
 def illustrate(*, api_key: str, model: str, prompts: list[dict]) -> list[dict]:
     """Generate simple instructional illustrations for the given prompts.
 
-    `prompts` is a list of {key, prompt}. Returns a list of {key, b64} for the
-    prompts that produced an image. Best-effort: prompts that fail (or a model
-    that isn't enabled on the key) are simply omitted, never raised.
+    Uses a Gemini native image model (e.g. gemini-2.5-flash-image) via
+    generate_content, reading the returned inline image data. `prompts` is a
+    list of {key, prompt}; returns {key, b64} for the prompts that produced an
+    image. Best-effort: prompts that fail (or a model not enabled on the key)
+    are simply omitted, never raised.
     """
     client = genai.Client(api_key=api_key)
     out: list[dict] = []
@@ -458,15 +460,19 @@ def illustrate(*, api_key: str, model: str, prompts: list[dict]) -> list[dict]:
         if not prompt:
             continue
         try:
-            resp = client.models.generate_images(
-                model=model,
-                prompt=prompt,
-                config=types.GenerateImagesConfig(number_of_images=1),
-            )
-            gen = (getattr(resp, "generated_images", None) or [])
-            if not gen:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            image_bytes = None
+            for cand in getattr(resp, "candidates", None) or []:
+                parts = getattr(getattr(cand, "content", None), "parts", None) or []
+                for part in parts:
+                    data = getattr(part, "inline_data", None)
+                    if data and getattr(data, "data", None):
+                        image_bytes = data.data
+                        break
+                if image_bytes:
+                    break
+            if not image_bytes:
                 continue
-            image_bytes = gen[0].image.image_bytes
             out.append({"key": item.get("key"), "b64": base64.b64encode(image_bytes).decode("ascii")})
         except Exception:  # noqa: BLE001 - best effort; skip failures
             continue

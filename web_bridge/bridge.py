@@ -905,7 +905,7 @@ def _illustrate(payload: dict[str, Any]) -> dict[str, Any]:
 
         images = illustrate(
             api_key=api_key,
-            model=payload.get("model") or "imagen-3.0-generate-002",
+            model=payload.get("model") or "gemini-2.5-flash-image",
             prompts=payload.get("prompts") or [],
         )
     except Exception as e:  # noqa: BLE001 - always return JSON to the caller
