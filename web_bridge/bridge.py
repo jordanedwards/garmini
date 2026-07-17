@@ -894,6 +894,26 @@ def _deep_analysis(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "report": out.model_dump()}
 
 
+def _illustrate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Generate instructional illustrations for deep-analysis findings."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    try:
+        from coach.gemini_coach import illustrate
+
+        images = illustrate(
+            api_key=api_key,
+            model=payload.get("model") or "imagen-3.0-generate-002",
+            prompts=payload.get("prompts") or [],
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Illustrate failed: {e!r}"}
+
+    return {"status": "ok", "images": images}
+
+
 def _chat(payload: dict[str, Any]) -> dict[str, Any]:
     """Free-form coach chat reply."""
     api_key = payload.get("api_key")
@@ -928,6 +948,7 @@ ACTIONS = {
     "predict_races": _predict_races,
     "profile_race": _profile_race,
     "deep_analysis": _deep_analysis,
+    "illustrate": _illustrate,
     "resolve_location": _resolve_location,
     "translate": _translate,
     "push_workouts": _push_workouts,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, Literal
 
@@ -440,6 +441,37 @@ def deep_analysis(
         return parsed
     data: dict[str, Any] = json.loads(response.text or "{}")
     return DeepAnalysisReport.model_validate(data)
+
+
+def illustrate(*, api_key: str, model: str, prompts: list[dict]) -> list[dict]:
+    """Generate simple instructional illustrations for the given prompts.
+
+    `prompts` is a list of {key, prompt}. Returns a list of {key, b64} for the
+    prompts that produced an image. Best-effort: prompts that fail (or a model
+    that isn't enabled on the key) are simply omitted, never raised.
+    """
+    client = genai.Client(api_key=api_key)
+    out: list[dict] = []
+
+    for item in prompts:
+        prompt = (item.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        try:
+            resp = client.models.generate_images(
+                model=model,
+                prompt=prompt,
+                config=types.GenerateImagesConfig(number_of_images=1),
+            )
+            gen = (getattr(resp, "generated_images", None) or [])
+            if not gen:
+                continue
+            image_bytes = gen[0].image.image_bytes
+            out.append({"key": item.get("key"), "b64": base64.b64encode(image_bytes).decode("ascii")})
+        except Exception:  # noqa: BLE001 - best effort; skip failures
+            continue
+
+    return out
 
 
 def chat_reply(
