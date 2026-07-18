@@ -294,11 +294,13 @@ class Client:
             email: Garmin account email.
             password: Garmin account password.
             prompt_mfa: Callable that returns an MFA code string when invoked.
-            return_on_mfa: When True, return ("needs_mfa", None) instead of
+            return_on_mfa: When True, return ("needs_mfa", <state>) instead of
                            calling prompt_mfa; caller must call resume_login().
 
         Returns:
-            (None, None) on success; ("needs_mfa", None) when return_on_mfa=True.
+            (None, None) on success; ("needs_mfa", <serialized state>) when
+            return_on_mfa=True — the state (from export_mfa_state) can resume
+            the login in another process via resume_login().
 
         """
         strategies: list[tuple[str, Any]] = [
@@ -343,7 +345,7 @@ class Client:
             except _MFARequired:
                 # MFA state is stored on self — handle and stop chain
                 if return_on_mfa:
-                    return "needs_mfa", None
+                    return "needs_mfa", self.export_mfa_state()
                 if prompt_mfa:
                     mfa_code = prompt_mfa()
                     self._complete_mfa(mfa_code)
@@ -398,6 +400,7 @@ class Client:
             try:
                 _LOGGER.debug("mobile+cffi trying impersonation=%s", imp)
                 sess: Any = cffi_requests.Session(impersonate=imp)  # type: ignore[arg-type]
+                sess._garmini_impersonate = imp
                 self._do_mobile_login(sess, email, password)
                 return
             except (GarminConnectAuthenticationError, _MFARequired):
@@ -523,6 +526,7 @@ class Client:
         if not HAS_CFFI:
             raise GarminConnectConnectionError("curl_cffi not available")
         sess: Any = cffi_requests.Session(impersonate="chrome", timeout=30)
+        sess._garmini_impersonate = "chrome"
         sso_base = f"{self._sso}/sso"
         sso_embed = f"{sso_base}/embed"
         embed_params = {
@@ -648,13 +652,22 @@ class Client:
     def _complete_mfa_widget(self, mfa_code: str) -> None:
         """Complete MFA for widget flow."""
         sess = getattr(self, "_mfa_session", None)
-        r = getattr(self, "_widget_last_resp", None)
-        if not sess or not r:
+        if not sess:
             raise GarminConnectAuthenticationError("Missing widget MFA context")
 
-        csrf_match = _CSRF_RE.search(r.text)
-        if not csrf_match:
-            raise GarminConnectAuthenticationError("Widget MFA: missing CSRF token")
+        # CSRF comes from the live challenge page, or from imported MFA state
+        # when resuming in a fresh process (import_mfa_state sets _mfa_csrf).
+        csrf = getattr(self, "_mfa_csrf", None)
+        if not csrf:
+            r = getattr(self, "_widget_last_resp", None)
+            if r is None:
+                raise GarminConnectAuthenticationError("Missing widget MFA context")
+            csrf_match = _CSRF_RE.search(r.text)
+            if not csrf_match:
+                raise GarminConnectAuthenticationError(
+                    "Widget MFA: missing CSRF token"
+                )
+            csrf = csrf_match.group(1)
 
         r = sess.post(
             f"{self._sso}/sso/verifyMFA/loginEnterMfaCode",
@@ -663,7 +676,7 @@ class Client:
             data={
                 "mfa-code": mfa_code,
                 "embed": "true",
-                "_csrf": csrf_match.group(1),
+                "_csrf": csrf,
                 "fromPage": "setupEnterMfaCode",
             },
             timeout=30,
@@ -705,6 +718,7 @@ class Client:
             try:
                 _LOGGER.debug("portal+cffi trying impersonation=%s", imp)
                 sess: Any = cffi_requests.Session(impersonate=imp)  # type: ignore[arg-type]
+                sess._garmini_impersonate = imp
                 self._do_portal_web_login(sess, email, password)
                 return
             except (GarminConnectAuthenticationError, _MFARequired):
@@ -1279,8 +1293,117 @@ class Client:
             return resp.json() if hasattr(resp, "json") else None
         return resp
 
-    def resume_login(self, _client_state: Any, mfa_code: str) -> tuple[str | None, Any]:
-        """Complete a previously initiated MFA login."""
+    def export_mfa_state(self) -> str:
+        """Serialize a pending MFA challenge so another process can finish it.
+
+        Captures everything ``_complete_mfa`` needs — flow, method, request
+        params/headers, SSO session cookies, and (widget flow) the CSRF token —
+        as a JSON string. Pass it to ``resume_login`` on a fresh ``Client`` to
+        complete the login after the original process has exited.
+
+        The state embeds live SSO session cookies: treat it as a secret and
+        discard it once the login completes. Garmin expires the underlying SSO
+        session after a few minutes, so resume promptly.
+        """
+        sess = getattr(self, "_mfa_session", None)
+        if sess is None:
+            raise GarminConnectAuthenticationError("No MFA login is pending")
+
+        state: dict[str, Any] = {
+            "flow": getattr(self, "_mfa_flow", "portal"),
+            "method": getattr(self, "_mfa_method", "email"),
+            "login_params": dict(getattr(self, "_mfa_login_params", None) or {}),
+            "post_headers": dict(getattr(self, "_mfa_post_headers", None) or {}),
+            "service_url": getattr(self, "_mfa_service_url", None),
+            "session_kind": (
+                "requests" if isinstance(sess, requests.Session) else "cffi"
+            ),
+            "impersonate": getattr(sess, "_garmini_impersonate", "chrome"),
+            "cookies": self._dump_session_cookies(sess),
+        }
+
+        if state["flow"] == "widget":
+            resp = getattr(self, "_widget_last_resp", None)
+            csrf_match = _CSRF_RE.search(resp.text) if resp is not None else None
+            if not csrf_match:
+                raise GarminConnectAuthenticationError(
+                    "Widget MFA: missing CSRF token"
+                )
+            state["csrf"] = csrf_match.group(1)
+
+        return json.dumps(state)
+
+    def import_mfa_state(self, client_state: str | dict[str, Any]) -> None:
+        """Rehydrate a pending MFA challenge exported by ``export_mfa_state``.
+
+        Rebuilds an equivalent HTTP session (same kind and TLS fingerprint,
+        same SSO cookies) and restores the ``_mfa_*`` attributes so
+        ``_complete_mfa`` can run as if the challenge had happened here.
+        """
+        try:
+            state: dict[str, Any] = (
+                json.loads(client_state)
+                if isinstance(client_state, str)
+                else dict(client_state)
+            )
+        except (ValueError, TypeError) as err:
+            raise GarminConnectAuthenticationError(
+                "Invalid MFA state (not valid JSON)"
+            ) from err
+
+        flow = state.get("flow")
+        cookies = state.get("cookies")
+        if not flow or not isinstance(cookies, list):
+            raise GarminConnectAuthenticationError("Invalid MFA state (missing keys)")
+
+        if state.get("session_kind") == "cffi" and HAS_CFFI:
+            impersonate = state.get("impersonate") or "chrome"
+            sess: Any = cffi_requests.Session(impersonate=impersonate)  # type: ignore[arg-type]
+            sess._garmini_impersonate = impersonate
+        else:
+            sess = requests.Session()
+
+        for c in cookies:
+            sess.cookies.set(
+                c["name"],
+                c["value"],
+                domain=c.get("domain") or "",
+                path=c.get("path") or "/",
+            )
+
+        self._mfa_session = sess
+        self._mfa_flow = flow
+        self._mfa_method = state.get("method") or "email"
+        self._mfa_login_params = state.get("login_params") or {}
+        self._mfa_post_headers = state.get("post_headers") or {}
+        if state.get("service_url"):
+            self._mfa_service_url = state["service_url"]
+        if flow == "widget":
+            self._mfa_csrf = state.get("csrf")
+
+    @staticmethod
+    def _dump_session_cookies(sess: Any) -> list[dict[str, str]]:
+        """Extract cookies from a requests or curl_cffi session as plain dicts."""
+        jar = getattr(sess.cookies, "jar", sess.cookies)
+        return [
+            {
+                "name": c.name,
+                "value": c.value or "",
+                "domain": c.domain or "",
+                "path": c.path or "/",
+            }
+            for c in jar
+        ]
+
+    def resume_login(self, client_state: Any, mfa_code: str) -> tuple[str | None, Any]:
+        """Complete a previously initiated MFA login.
+
+        When this instance still holds the live MFA session (same-process
+        resume), ``client_state`` is not needed. Otherwise pass the string from
+        ``export_mfa_state`` and the challenge is rehydrated first.
+        """
+        if getattr(self, "_mfa_session", None) is None and client_state:
+            self.import_mfa_state(client_state)
         self._complete_mfa(mfa_code)
         return None, None
 

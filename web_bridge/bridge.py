@@ -2,19 +2,22 @@
 """Stateless bridge between the Laravel web app (garmini.ca) and the Garmin coach.
 
 The web app invokes this as a short-lived subprocess, passes a JSON command on
-stdin, and reads a single JSON object from stdout. No MFA (username/password only,
-the way the CLI currently works); MFA accounts are reported as ``needs_mfa``.
+stdin, and reads a single JSON object from stdout. MFA accounts get a two-step
+flow: ``login`` returns ``needs_mfa`` plus a serialized challenge state, and a
+follow-up ``mfa`` call (a fresh process) completes it with the user's code.
 
 Usage:
     echo '{"email": "...", "password": "..."}' | python3 bridge.py login
+    echo '{"email": "...", "mfa_state": "...", "code": "123456"}' | python3 bridge.py mfa
 
 Actions:
     login   Authenticate with Garmin and return the refreshable token blob.
+    mfa     Complete a pending MFA challenge and return the token blob.
 
 Output (one JSON object on stdout):
     {"status": "connected", "tokens": "<json string>"}
-    {"status": "needs_mfa"}
-    {"status": "error", "message": "..."}
+    {"status": "needs_mfa", "mfa_state": "<json string>", "mfa_method": "email"}
+    {"status": "error", "message": "...", "code": "<optional machine code>"}
 """
 
 from __future__ import annotations
@@ -495,7 +498,20 @@ def _login(payload: dict[str, Any]) -> dict[str, Any]:
             garmin = Garmin(email=email, password=password, prompt_mfa=_prompt_mfa)
             garmin.login(str(tokenstore))
         except _MFANeeded:
-            return {"status": "needs_mfa"}
+            # The challenge context (SSO cookies, flow, CSRF) is captured on
+            # the client; hand it to the web app so a later `mfa` invocation
+            # can finish the login after the user enters their code.
+            try:
+                return {
+                    "status": "needs_mfa",
+                    "mfa_state": garmin.client.export_mfa_state(),
+                    "mfa_method": getattr(garmin.client, "_mfa_method", "email"),
+                }
+            except Exception as e:  # noqa: BLE001 - always return JSON
+                return {
+                    "status": "error",
+                    "message": f"MFA challenge could not be captured: {e!r}",
+                }
         except GarminConnectAuthenticationError:
             return {"status": "error", "message": "Invalid Garmin email or password."}
         except GarminConnectTooManyRequestsError:
@@ -508,6 +524,58 @@ def _login(payload: dict[str, Any]) -> dict[str, Any]:
         blob = _read_token_blob(tokenstore)
         if blob == "{}":
             return {"status": "error", "message": "Login produced no tokens."}
+        return {"status": "connected", "tokens": blob}
+
+
+def _mfa(payload: dict[str, Any]) -> dict[str, Any]:
+    """Complete a pending MFA challenge started by a previous `login` call."""
+    from garminconnect import (
+        Garmin,
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+        GarminConnectTooManyRequestsError,
+    )
+
+    email = (payload.get("email") or "").strip()
+    mfa_state = payload.get("mfa_state") or ""
+    code = (payload.get("code") or "").strip()
+    if not email or not mfa_state or not code:
+        return {
+            "status": "error",
+            "message": "Email, mfa_state and code are required.",
+        }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokenstore = Path(tmp)
+        try:
+            garmin = Garmin(email=email)
+            garmin.resume_login(mfa_state, code)
+            garmin.client.dump(str(tokenstore))
+        except GarminConnectAuthenticationError as e:
+            # A stale/garbled challenge is unrecoverable; a rejected code can
+            # simply be retyped. The web app branches on `code`.
+            msg = str(e)
+            if "MFA state" in msg or "MFA context" in msg:
+                return {
+                    "status": "error",
+                    "code": "mfa_expired",
+                    "message": "The sign-in attempt expired — start over.",
+                }
+            return {
+                "status": "error",
+                "code": "bad_mfa_code",
+                "message": "Garmin rejected the code — check it and try again.",
+            }
+        except GarminConnectTooManyRequestsError:
+            return {"status": "error", "message": "Garmin rate limit — try again later."}
+        except GarminConnectConnectionError as e:
+            return {"status": "error", "message": f"Garmin connection error: {e}"}
+        except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+            return {"status": "error", "message": f"Unexpected error: {e!r}"}
+
+        blob = _read_token_blob(tokenstore)
+        if blob == "{}":
+            return {"status": "error", "message": "MFA login produced no tokens."}
         return {"status": "connected", "tokens": blob}
 
 
@@ -941,6 +1009,7 @@ def _chat(payload: dict[str, Any]) -> dict[str, Any]:
 
 ACTIONS = {
     "login": _login,
+    "mfa": _mfa,
     "sync": _sync,
     "activities": _activities,
     "refresh_plan": _refresh_plan,

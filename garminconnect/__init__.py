@@ -565,7 +565,9 @@ class Garmin:
         """Log in natively.
 
         Returns:
-            Tuple[str | None, str | None]: (needs_mfa, None) when MFA is required;
+            Tuple[str | None, str | None]: ("needs_mfa", <serialized MFA state>)
+            when MFA is required in return_on_mfa mode — pass the state to
+            resume_login() (in this or any later process) with the user's code;
             (None, None) on clean successful login.
 
         """
