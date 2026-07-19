@@ -957,6 +957,33 @@ def _deep_analysis(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "report": out.model_dump()}
 
 
+def _race_analysis(payload: dict[str, Any]) -> dict[str, Any]:
+    """Post-race analysis: legs in order, cascade effects, weather, debrief."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    try:
+        from coach.gemini_coach import race_analysis
+
+        out = race_analysis(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            athlete=payload.get("athlete") or "",
+            race_json=json.dumps(payload.get("race") or {}),
+            legs_json=json.dumps(payload.get("legs") or []),
+            transitions_json=json.dumps(payload.get("transitions") or []),
+            context_json=json.dumps(payload.get("context") or {}),
+            weather_json=json.dumps(payload.get("weather")),
+            lead_in_json=payload.get("lead_in") or "{}",
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Race analysis failed: {e!r}"}
+
+    return {"status": "ok", "report": out.model_dump()}
+
+
 def _illustrate(payload: dict[str, Any]) -> dict[str, Any]:
     """Generate instructional illustrations for deep-analysis findings."""
     api_key = payload.get("api_key")
@@ -1012,6 +1039,7 @@ ACTIONS = {
     "predict_races": _predict_races,
     "profile_race": _profile_race,
     "deep_analysis": _deep_analysis,
+    "race_analysis": _race_analysis,
     "illustrate": _illustrate,
     "resolve_location": _resolve_location,
     "translate": _translate,
