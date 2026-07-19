@@ -376,6 +376,128 @@ def profile_race(
     return profile
 
 
+class RaceLegAnalysis(BaseModel):
+    leg: str  # swim | bike | run (or the sport of a single-sport race)
+    execution: str  # e.g. "well executed", "overcooked", "conservative", "derailed"
+    observation: str  # what the data + the athlete's account show, citing actual numbers
+    cascade_effect: str = ""  # how this leg's execution affected the legs after it
+
+
+class RaceAnalysisReport(BaseModel):
+    summary: str  # 2-4 sentences: the coach's overall read on the race
+    vs_prediction: str = ""  # actual vs the pre-race prediction, when one exists
+    legs: list[RaceLegAnalysis] = []
+    pacing_verdict: str = ""
+    conditions_impact: str = ""  # how observed/felt weather changed what a good day looked like
+    nutrition_assessment: str = ""
+    placement_context: str = ""  # where they landed in the field, if determinable
+    what_went_well: list[str] = []
+    lessons: list[str] = []
+    next_time: list[str] = []  # concrete changes for the next race
+    recovery_guidance: str = ""
+    sources: list[str] = []  # URLs used for results research
+
+
+def race_analysis(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    athlete: str,
+    race_json: str,
+    legs_json: str,
+    transitions_json: str,
+    context_json: str,
+    weather_json: str,
+    lead_in_json: str,
+) -> RaceAnalysisReport:
+    """Post-race analysis: legs in order, cascade effects, conditions, and the
+    athlete's own account. Results research (placement) is a best-effort
+    search-grounded first pass — same two-call pattern as profile_race, since
+    grounding can't be combined with a response schema.
+    """
+    client = genai.Client(api_key=api_key)
+
+    results_notes = ""
+    urls: list[str] = []
+    try:
+        race = json.loads(race_json)
+        if race.get("name"):
+            research = client.models.generate_content(
+                model=model,
+                contents=(
+                    "Find the official results for this race using web search "
+                    "(results platforms like sportstats.ca, startlinetiming.com, zone4.ca, "
+                    "or the race website).\n\n"
+                    f"Race: {race.get('name')} on {race.get('date')}"
+                    f"{' at ' + race['location'] if race.get('location') else ''}.\n"
+                    f"Athlete: {athlete}."
+                    f"{' Reported finish time: ' + str(json.loads(context_json).get('finish_time')) if json.loads(context_json).get('finish_time') else ''}\n\n"
+                    "Report: the athlete's placement (overall and age group) if findable, "
+                    "field size, the winning time and a typical mid-pack time for their "
+                    "event. If you cannot find the results, say so plainly — never invent "
+                    "placements or times."
+                ),
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                    temperature=0.2,
+                ),
+            )
+            results_notes = (research.text or "").strip()
+            for cand in getattr(research, "candidates", None) or []:
+                meta = getattr(cand, "grounding_metadata", None)
+                for chunk in getattr(meta, "grounding_chunks", None) or []:
+                    uri = getattr(getattr(chunk, "web", None), "uri", None)
+                    if uri:
+                        urls.append(uri)
+    except Exception:  # noqa: BLE001, S110 - research is strictly best-effort
+        pass
+
+    user_content = (
+        "Write the post-race analysis for this athlete's race.\n\n"
+        f"=== RACE (JSON: name, date, distance, priority, pre-race prediction, course profile) ===\n{race_json}\n\n"
+        f"=== RACE-DAY LEGS, IN START ORDER (JSON: durations, distance, HR, power, splits) ===\n{legs_json}\n\n"
+        f"=== TRANSITIONS (JSON: estimated from gaps between legs) ===\n{transitions_json}\n\n"
+        f"=== THE ATHLETE'S OWN DEBRIEF (JSON: their account — treat as ground truth for how it felt) ===\n{context_json}\n\n"
+        f"=== OBSERVED WEATHER DURING THE RACE (JSON, from a weather archive; may be null) ===\n{weather_json}\n\n"
+        f"=== RESULTS RESEARCH NOTES (may be empty) ===\n{results_notes or '(none found)'}\n\n"
+        f"=== ATHLETE'S LEAD-IN METRICS (JSON: recent training state) ===\n{lead_in_json}\n\n"
+        "A race is not a workout — analyse it causally, in leg order: a hard swim raises "
+        "HR into the bike; an overcooked bike empties the legs for the run. For every leg "
+        "give the observation (citing actual numbers from the data) and, where the "
+        "evidence supports it, the cascade effect on later legs. Judge pacing and "
+        "execution against the conditions — heat, wind, rain and chop change what a good "
+        "split looks like; adjust expectations before criticising. Weigh the athlete's own "
+        "account at least as heavily as the numbers, especially for nutrition, mishaps and "
+        "how legs felt. Compare against the pre-race prediction when present. Use the "
+        "results research for placement context only if it clearly matches this athlete — "
+        "when in doubt, rely on the placement they reported themselves, and never invent "
+        "results. Finish with what went well, lessons, concrete changes for next time, and "
+        "recovery guidance for the coming days sized to the race distance and how hard it "
+        "was."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=RaceAnalysisReport,
+            temperature=0.3,
+        ),
+    )
+
+    parsed = getattr(response, "parsed", None)
+    report = (
+        parsed
+        if isinstance(parsed, RaceAnalysisReport)
+        else RaceAnalysisReport.model_validate(json.loads(response.text or "{}"))
+    )
+    report.sources = list(dict.fromkeys([*report.sources, *urls]))[:8]
+    return report
+
+
 class DeepAnalysisFinding(BaseModel):
     dimension: str  # e.g. "Vertical oscillation", "Cadence", "Pacing discipline"
     severity: str  # strength | minor | notable | priority
