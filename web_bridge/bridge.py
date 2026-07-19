@@ -689,6 +689,22 @@ def _extract_activity(detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_zones(raw: Any) -> list[dict[str, Any]] | None:
+    """Compact Garmin's timeInZones payload to [{zone, secs, low}, ...]."""
+    if not isinstance(raw, list):
+        return None
+    out = []
+    for z in raw:
+        if not isinstance(z, dict) or z.get("secsInZone") is None:
+            continue
+        out.append({
+            "zone": z.get("zoneNumber"),
+            "secs": round(float(z["secsInZone"])),
+            "low": z.get("zoneLowBoundary"),
+        })
+    return out or None
+
+
 def _activities(payload: dict[str, Any]) -> dict[str, Any]:
     """Fetch full per-activity detail for recent run/bike/swim activities.
 
@@ -759,6 +775,18 @@ def _activities(payload: dict[str, Any]) -> dict[str, Any]:
                     rec["splits"] = api.get_activity_typed_splits(str(aid))
                 except Exception:  # noqa: BLE001
                     rec["splits"] = None
+            # Intensity distribution — the evidence averages can't show.
+            try:
+                rec["hr_zones"] = _compact_zones(api.get_activity_hr_in_timezones(str(aid)))
+            except Exception:  # noqa: BLE001
+                rec["hr_zones"] = None
+            if rec.get("sport") == "bike":
+                try:
+                    rec["power_zones"] = _compact_zones(
+                        api.get_activity_power_in_timezones(str(aid))
+                    )
+                except Exception:  # noqa: BLE001
+                    rec["power_zones"] = None
             activities.append(rec)
             time.sleep(0.2)  # be gentle on the Garmin API across many detail calls
 

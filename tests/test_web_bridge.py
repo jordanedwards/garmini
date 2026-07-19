@@ -132,3 +132,19 @@ def test_mfa_maps_stale_state_to_expired():
 
     assert out["status"] == "error"
     assert out["code"] == "mfa_expired"
+
+
+def test_compact_zones_maps_and_filters():
+    raw = [
+        {"zoneNumber": 1, "secsInZone": 600.4, "zoneLowBoundary": 100},
+        {"zoneNumber": 2, "secsInZone": 1800.6, "zoneLowBoundary": 130},
+        {"zoneNumber": 3},  # no secs -> dropped
+        "garbage",
+    ]
+    assert bridge._compact_zones(raw) == [
+        {"zone": 1, "secs": 600, "low": 100},
+        {"zone": 2, "secs": 1801, "low": 130},
+    ]
+    assert bridge._compact_zones(None) is None
+    assert bridge._compact_zones([]) is None
+    assert bridge._compact_zones([{"zoneNumber": 1}]) is None
