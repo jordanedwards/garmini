@@ -483,35 +483,30 @@ def _login(payload: dict[str, Any]) -> dict[str, Any]:
     if not email or not password:
         return {"status": "error", "message": "Email and password are required."}
 
-    # A prompt_mfa callback that raises only if Garmin actually demands MFA.
-    # Non-MFA accounts never trigger it, so login follows the normal path that
-    # persists the token blob to the token store (return_on_mfa=True skips that).
-    class _MFANeeded(Exception):
-        pass
-
-    def _prompt_mfa() -> str:
-        raise _MFANeeded()
-
+    # return_on_mfa (not a raising prompt_mfa callback): Garmin.login's
+    # catch-all exception handler would swallow a sentinel raised from the
+    # callback and turn it into GarminConnectConnectionError("Login failed:"),
+    # so the needs_mfa signal never reached the web app.
     with tempfile.TemporaryDirectory() as tmp:
         tokenstore = Path(tmp)
         try:
-            garmin = Garmin(email=email, password=password, prompt_mfa=_prompt_mfa)
-            garmin.login(str(tokenstore))
-        except _MFANeeded:
-            # The challenge context (SSO cookies, flow, CSRF) is captured on
-            # the client; hand it to the web app so a later `mfa` invocation
-            # can finish the login after the user enters their code.
-            try:
+            garmin = Garmin(email=email, password=password, return_on_mfa=True)
+            status, mfa_state = garmin.login(str(tokenstore))
+            if status == "needs_mfa":
+                if not mfa_state:
+                    return {
+                        "status": "error",
+                        "message": "MFA challenge could not be captured.",
+                    }
+                # The serialized challenge lets a later `mfa` invocation (a
+                # fresh process) finish the login with the user's code.
                 return {
                     "status": "needs_mfa",
-                    "mfa_state": garmin.client.export_mfa_state(),
+                    "mfa_state": mfa_state,
                     "mfa_method": getattr(garmin.client, "_mfa_method", "email"),
                 }
-            except Exception as e:  # noqa: BLE001 - always return JSON
-                return {
-                    "status": "error",
-                    "message": f"MFA challenge could not be captured: {e!r}",
-                }
+            # return_on_mfa mode skips the tokenstore dump — persist explicitly.
+            garmin.client.dump(str(tokenstore))
         except GarminConnectAuthenticationError:
             return {"status": "error", "message": "Invalid Garmin email or password."}
         except GarminConnectTooManyRequestsError:
