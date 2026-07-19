@@ -2,19 +2,22 @@
 """Stateless bridge between the Laravel web app (garmini.ca) and the Garmin coach.
 
 The web app invokes this as a short-lived subprocess, passes a JSON command on
-stdin, and reads a single JSON object from stdout. No MFA (username/password only,
-the way the CLI currently works); MFA accounts are reported as ``needs_mfa``.
+stdin, and reads a single JSON object from stdout. MFA accounts get a two-step
+flow: ``login`` returns ``needs_mfa`` plus a serialized challenge state, and a
+follow-up ``mfa`` call (a fresh process) completes it with the user's code.
 
 Usage:
     echo '{"email": "...", "password": "..."}' | python3 bridge.py login
+    echo '{"email": "...", "mfa_state": "...", "code": "123456"}' | python3 bridge.py mfa
 
 Actions:
     login   Authenticate with Garmin and return the refreshable token blob.
+    mfa     Complete a pending MFA challenge and return the token blob.
 
 Output (one JSON object on stdout):
     {"status": "connected", "tokens": "<json string>"}
-    {"status": "needs_mfa"}
-    {"status": "error", "message": "..."}
+    {"status": "needs_mfa", "mfa_state": "<json string>", "mfa_method": "email"}
+    {"status": "error", "message": "...", "code": "<optional machine code>"}
 """
 
 from __future__ import annotations
@@ -480,22 +483,30 @@ def _login(payload: dict[str, Any]) -> dict[str, Any]:
     if not email or not password:
         return {"status": "error", "message": "Email and password are required."}
 
-    # A prompt_mfa callback that raises only if Garmin actually demands MFA.
-    # Non-MFA accounts never trigger it, so login follows the normal path that
-    # persists the token blob to the token store (return_on_mfa=True skips that).
-    class _MFANeeded(Exception):
-        pass
-
-    def _prompt_mfa() -> str:
-        raise _MFANeeded()
-
+    # return_on_mfa (not a raising prompt_mfa callback): Garmin.login's
+    # catch-all exception handler would swallow a sentinel raised from the
+    # callback and turn it into GarminConnectConnectionError("Login failed:"),
+    # so the needs_mfa signal never reached the web app.
     with tempfile.TemporaryDirectory() as tmp:
         tokenstore = Path(tmp)
         try:
-            garmin = Garmin(email=email, password=password, prompt_mfa=_prompt_mfa)
-            garmin.login(str(tokenstore))
-        except _MFANeeded:
-            return {"status": "needs_mfa"}
+            garmin = Garmin(email=email, password=password, return_on_mfa=True)
+            status, mfa_state = garmin.login(str(tokenstore))
+            if status == "needs_mfa":
+                if not mfa_state:
+                    return {
+                        "status": "error",
+                        "message": "MFA challenge could not be captured.",
+                    }
+                # The serialized challenge lets a later `mfa` invocation (a
+                # fresh process) finish the login with the user's code.
+                return {
+                    "status": "needs_mfa",
+                    "mfa_state": mfa_state,
+                    "mfa_method": getattr(garmin.client, "_mfa_method", "email"),
+                }
+            # return_on_mfa mode skips the tokenstore dump — persist explicitly.
+            garmin.client.dump(str(tokenstore))
         except GarminConnectAuthenticationError:
             return {"status": "error", "message": "Invalid Garmin email or password."}
         except GarminConnectTooManyRequestsError:
@@ -508,6 +519,58 @@ def _login(payload: dict[str, Any]) -> dict[str, Any]:
         blob = _read_token_blob(tokenstore)
         if blob == "{}":
             return {"status": "error", "message": "Login produced no tokens."}
+        return {"status": "connected", "tokens": blob}
+
+
+def _mfa(payload: dict[str, Any]) -> dict[str, Any]:
+    """Complete a pending MFA challenge started by a previous `login` call."""
+    from garminconnect import (
+        Garmin,
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+        GarminConnectTooManyRequestsError,
+    )
+
+    email = (payload.get("email") or "").strip()
+    mfa_state = payload.get("mfa_state") or ""
+    code = (payload.get("code") or "").strip()
+    if not email or not mfa_state or not code:
+        return {
+            "status": "error",
+            "message": "Email, mfa_state and code are required.",
+        }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokenstore = Path(tmp)
+        try:
+            garmin = Garmin(email=email)
+            garmin.resume_login(mfa_state, code)
+            garmin.client.dump(str(tokenstore))
+        except GarminConnectAuthenticationError as e:
+            # A stale/garbled challenge is unrecoverable; a rejected code can
+            # simply be retyped. The web app branches on `code`.
+            msg = str(e)
+            if "MFA state" in msg or "MFA context" in msg:
+                return {
+                    "status": "error",
+                    "code": "mfa_expired",
+                    "message": "The sign-in attempt expired — start over.",
+                }
+            return {
+                "status": "error",
+                "code": "bad_mfa_code",
+                "message": "Garmin rejected the code — check it and try again.",
+            }
+        except GarminConnectTooManyRequestsError:
+            return {"status": "error", "message": "Garmin rate limit — try again later."}
+        except GarminConnectConnectionError as e:
+            return {"status": "error", "message": f"Garmin connection error: {e}"}
+        except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+            return {"status": "error", "message": f"Unexpected error: {e!r}"}
+
+        blob = _read_token_blob(tokenstore)
+        if blob == "{}":
+            return {"status": "error", "message": "MFA login produced no tokens."}
         return {"status": "connected", "tokens": blob}
 
 
@@ -626,6 +689,22 @@ def _extract_activity(detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_zones(raw: Any) -> list[dict[str, Any]] | None:
+    """Compact Garmin's timeInZones payload to [{zone, secs, low}, ...]."""
+    if not isinstance(raw, list):
+        return None
+    out = []
+    for z in raw:
+        if not isinstance(z, dict) or z.get("secsInZone") is None:
+            continue
+        out.append({
+            "zone": z.get("zoneNumber"),
+            "secs": round(float(z["secsInZone"])),
+            "low": z.get("zoneLowBoundary"),
+        })
+    return out or None
+
+
 def _activities(payload: dict[str, Any]) -> dict[str, Any]:
     """Fetch full per-activity detail for recent run/bike/swim activities.
 
@@ -696,6 +775,18 @@ def _activities(payload: dict[str, Any]) -> dict[str, Any]:
                     rec["splits"] = api.get_activity_typed_splits(str(aid))
                 except Exception:  # noqa: BLE001
                     rec["splits"] = None
+            # Intensity distribution — the evidence averages can't show.
+            try:
+                rec["hr_zones"] = _compact_zones(api.get_activity_hr_in_timezones(str(aid)))
+            except Exception:  # noqa: BLE001
+                rec["hr_zones"] = None
+            if rec.get("sport") == "bike":
+                try:
+                    rec["power_zones"] = _compact_zones(
+                        api.get_activity_power_in_timezones(str(aid))
+                    )
+                except Exception:  # noqa: BLE001
+                    rec["power_zones"] = None
             activities.append(rec)
             time.sleep(0.2)  # be gentle on the Garmin API across many detail calls
 
@@ -894,6 +985,33 @@ def _deep_analysis(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "ok", "report": out.model_dump()}
 
 
+def _race_analysis(payload: dict[str, Any]) -> dict[str, Any]:
+    """Post-race analysis: legs in order, cascade effects, weather, debrief."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    try:
+        from coach.gemini_coach import race_analysis
+
+        out = race_analysis(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            athlete=payload.get("athlete") or "",
+            race_json=json.dumps(payload.get("race") or {}),
+            legs_json=json.dumps(payload.get("legs") or []),
+            transitions_json=json.dumps(payload.get("transitions") or []),
+            context_json=json.dumps(payload.get("context") or {}),
+            weather_json=json.dumps(payload.get("weather")),
+            lead_in_json=payload.get("lead_in") or "{}",
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Race analysis failed: {e!r}"}
+
+    return {"status": "ok", "report": out.model_dump()}
+
+
 def _illustrate(payload: dict[str, Any]) -> dict[str, Any]:
     """Generate instructional illustrations for deep-analysis findings."""
     api_key = payload.get("api_key")
@@ -941,6 +1059,7 @@ def _chat(payload: dict[str, Any]) -> dict[str, Any]:
 
 ACTIONS = {
     "login": _login,
+    "mfa": _mfa,
     "sync": _sync,
     "activities": _activities,
     "refresh_plan": _refresh_plan,
@@ -948,6 +1067,7 @@ ACTIONS = {
     "predict_races": _predict_races,
     "profile_race": _profile_race,
     "deep_analysis": _deep_analysis,
+    "race_analysis": _race_analysis,
     "illustrate": _illustrate,
     "resolve_location": _resolve_location,
     "translate": _translate,
