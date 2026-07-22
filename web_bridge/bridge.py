@@ -47,13 +47,33 @@ def _read_token_blob(tokenstore: Path) -> str:
 
 
 def _sport_bucket(type_key: str | None) -> str | None:
+    """Map a Garmin activityType typeKey to one of our canonical sport buckets,
+    or None for a type we don't capture. Substring matching handles Garmin's many
+    variants (trail_running, lap_swimming, mountain_biking, resort_skiing, …).
+
+    Order matters: check multisport first (its parent typeKey is `multi_sport`),
+    then the endurance sports, then the newer cross-training buckets."""
     tk = (type_key or "").lower()
+    # Multisport PARENT (triathlon/duathlon/brick). Child legs carry their own
+    # swim/bike/run typeKey and bucket to those below; only the parent is `multi`.
+    if "multi" in tk:
+        return "multisport"
     if "swim" in tk:
         return "swim"
     if "cycl" in tk or "bik" in tk or "ride" in tk:
         return "bike"
     if "run" in tk:
         return "run"
+    if "hik" in tk:
+        return "hike"
+    if "ski" in tk or "snowboard" in tk:
+        return "ski"
+    if "hockey" in tk:
+        return "hockey"
+    if "strength" in tk:
+        return "strength"
+    if "cardio" in tk or "hiit" in tk:
+        return "cardio"
     return None
 
 
@@ -81,8 +101,10 @@ def _monthly_distances(api: Any, end: Any, months: int = 6) -> dict[str, Any]:
         month = (a.get("startTimeLocal") or "")[:7]
         if len(month) != 7:
             continue
+        # Keep swim/bike/run always present (consumers rely on them); create a
+        # key on demand for any other captured sport so we never KeyError.
         buckets.setdefault(month, {"swim": 0.0, "bike": 0.0, "run": 0.0})
-        buckets[month][sport] += float(a.get("distance") or 0) / 1000.0
+        buckets[month][sport] = buckets[month].get(sport, 0.0) + float(a.get("distance") or 0) / 1000.0
 
     return {mo: {k: round(v, 1) for k, v in vals.items()} for mo, vals in sorted(buckets.items())}
 
@@ -623,6 +645,7 @@ def _sync(payload: dict[str, Any]) -> dict[str, Any]:
                 "load_focus": m._compress_load_focus(gde.collect_load_focus(api, end)),
                 "heart_rate_zones": zones,
                 "heart_rate_summary": gde.collect_hr_summary(api, end, zones),
+                "athlete": gde.collect_athlete_profile(api),
                 "recent_activities": m._compress_activities(
                     gde.collect_activities(api, end)
                 ),
@@ -706,7 +729,9 @@ def _compact_zones(raw: Any) -> list[dict[str, Any]] | None:
 
 
 def _activities(payload: dict[str, Any]) -> dict[str, Any]:
-    """Fetch full per-activity detail for recent run/bike/swim activities.
+    """Fetch full per-activity detail for recent captured activities (any sport
+    _sport_bucket recognizes: swim/bike/run/hike/ski/hockey/strength/cardio and
+    multisport parents).
 
     Payload: {tokens, days=7, limit=50, start_date?, end_date?, include_splits?}
     """
@@ -749,7 +774,8 @@ def _activities(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             return {"status": "error", "message": f"Activity list failed: {e!r}"}
 
-        # Keep only run/bike/swim, newest first, bounded by limit.
+        # Keep any sport we bucket (drops walking/yoga/etc.), newest first,
+        # bounded by limit.
         wanted = [
             s for s in summaries
             if isinstance(s, dict)
@@ -789,6 +815,19 @@ def _activities(payload: dict[str, Any]) -> dict[str, Any]:
                     rec["power_zones"] = None
             activities.append(rec)
             time.sleep(0.2)  # be gentle on the Garmin API across many detail calls
+
+        # Refine multisport parents to "triathlon" when their legs are the classic
+        # swim+bike+run. Children carry parent_id; the parent is is_multisport_parent.
+        legs_by_parent: dict[Any, set[str]] = {}
+        for rec in activities:
+            pid = rec.get("parent_id")
+            if pid is not None and rec.get("sport") in {"swim", "bike", "run"}:
+                legs_by_parent.setdefault(pid, set()).add(rec["sport"])
+        for rec in activities:
+            if rec.get("is_multisport_parent") and rec.get("sport") == "multisport":
+                legs = legs_by_parent.get(rec.get("garmin_activity_id"), set())
+                if {"swim", "bike", "run"} <= legs:
+                    rec["sport"] = "triathlon"
 
         return {
             "status": "connected",
@@ -852,6 +891,7 @@ def _predict_races(payload: dict[str, Any]) -> dict[str, Any]:
             system_prompt=payload.get("system_prompt") or "",
             metrics_json=json.dumps(payload.get("metrics") or {}),
             races_json=json.dumps(payload.get("races") or []),
+            past_races_json=json.dumps(payload.get("past_races") or []),
             today=payload.get("today") or date.today().isoformat(),
         )
     except Exception as e:  # noqa: BLE001 - always return JSON to the caller
@@ -1044,17 +1084,102 @@ def _chat(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         from coach.gemini_coach import chat_reply
 
-        reply = chat_reply(
+        result = chat_reply(
             api_key=api_key,
             model=payload.get("model") or "gemini-2.5-flash",
             system_prompt=payload.get("system_prompt") or "",
             history=payload.get("history") or [],
             message=message,
+            today=payload.get("today") or "",
         )
     except Exception as e:  # noqa: BLE001 - always return JSON to the caller
         return {"status": "error", "message": f"Chat failed: {e!r}"}
 
-    return {"status": "ok", "reply": reply}
+    return {
+        "status": "ok",
+        "reply": result.reply,
+        # Populated only when the coach decided a training change was warranted.
+        "plan_changed": result.plan_changed,
+        "plan_markdown": result.plan_markdown,
+        "daily_sessions": [s.model_dump() for s in result.daily_sessions],
+    }
+
+
+def _predict_ftp(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project cycling/running FTP over the next 12 weeks under the current plan."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    from datetime import date
+
+    try:
+        from coach.gemini_coach import predict_ftp
+
+        out = predict_ftp(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            current_json=json.dumps(payload.get("current") or {}),
+            today=payload.get("today") or date.today().isoformat(),
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"FTP projection failed: {e!r}"}
+
+    return {
+        "status": "ok",
+        "points": [p.model_dump() for p in out.points],
+        "rationale": out.rationale,
+    }
+
+
+def _predict_vo2(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project running/cycling VO2 max over the next 12 weeks under the current plan."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    from datetime import date
+
+    try:
+        from coach.gemini_coach import predict_vo2
+
+        out = predict_vo2(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            current_json=json.dumps(payload.get("current") or {}),
+            today=payload.get("today") or date.today().isoformat(),
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"VO2 projection failed: {e!r}"}
+
+    return {
+        "status": "ok",
+        "points": [p.model_dump() for p in out.points],
+        "rationale": out.rationale,
+    }
+
+
+def _fitness_snapshot_notes(payload: dict[str, Any]) -> dict[str, Any]:
+    """Short interpretive notes for the athlete's computed fitness snapshot."""
+    api_key = payload.get("api_key")
+    if not api_key:
+        return {"status": "error", "message": "No Gemini API key configured."}
+
+    try:
+        from coach.gemini_coach import fitness_snapshot_notes
+
+        notes = fitness_snapshot_notes(
+            api_key=api_key,
+            model=payload.get("model") or "gemini-2.5-flash",
+            system_prompt=payload.get("system_prompt") or "",
+            snapshot_json=json.dumps(payload.get("snapshot") or {}),
+        )
+    except Exception as e:  # noqa: BLE001 - always return JSON to the caller
+        return {"status": "error", "message": f"Snapshot notes failed: {e!r}"}
+
+    return {"status": "ok", "notes": notes.model_dump()}
 
 
 ACTIONS = {
@@ -1065,6 +1190,9 @@ ACTIONS = {
     "refresh_plan": _refresh_plan,
     "motivate": _motivate,
     "predict_races": _predict_races,
+    "predict_ftp": _predict_ftp,
+    "predict_vo2": _predict_vo2,
+    "fitness_snapshot_notes": _fitness_snapshot_notes,
     "profile_race": _profile_race,
     "deep_analysis": _deep_analysis,
     "race_analysis": _race_analysis,
@@ -1074,6 +1202,59 @@ ACTIONS = {
     "push_workouts": _push_workouts,
     "chat": _chat,
 }
+
+
+# ---- Gemini token-usage metering --------------------------------------------
+# Every Gemini response carries usage_metadata; we accumulate it per model for
+# this bridge invocation so the web app can record and cost it. One invocation is
+# a single action, but an action may make several model calls (e.g. deep_analysis
+# then illustrate), possibly on different models — hence keyed by model.
+_USAGE: dict[str, dict[str, int]] = {}
+
+
+def _install_usage_metering() -> None:
+    """Wrap the SDK's generate_content once so every call is metered. Best-effort:
+    if the SDK shape changes, metering silently no-ops and never breaks a call."""
+    try:
+        from google.genai import models as _models
+    except Exception:  # noqa: BLE001
+        return
+
+    if getattr(_models.Models.generate_content, "_garmini_metered", False):
+        return
+
+    _orig = _models.Models.generate_content
+
+    def _metered(self, *args, **kwargs):
+        resp = _orig(self, *args, **kwargs)
+        try:
+            model = kwargs.get("model") or (args[0] if args else "unknown")
+            um = getattr(resp, "usage_metadata", None)
+            if um is not None:
+                b = _USAGE.setdefault(str(model), {"prompt": 0, "output": 0, "thinking": 0, "calls": 0})
+                b["prompt"] += int(getattr(um, "prompt_token_count", 0) or 0)
+                b["output"] += int(getattr(um, "candidates_token_count", 0) or 0)
+                b["thinking"] += int(getattr(um, "thoughts_token_count", 0) or 0)
+                b["calls"] += 1
+        except Exception:  # noqa: BLE001
+            pass
+        return resp
+
+    _metered._garmini_metered = True
+    _models.Models.generate_content = _metered
+
+
+def _usage_list() -> list[dict[str, Any]]:
+    return [
+        {
+            "model": model,
+            "prompt_tokens": v["prompt"],
+            "output_tokens": v["output"],
+            "thinking_tokens": v["thinking"],
+            "calls": v["calls"],
+        }
+        for model, v in _USAGE.items()
+    ]
 
 
 def main() -> int:
@@ -1089,7 +1270,13 @@ def main() -> int:
         print(json.dumps({"status": "error", "message": "Invalid JSON on stdin."}))
         return 2
 
-    print(json.dumps(handler(payload)))
+    _install_usage_metering()
+    result = handler(payload)
+    # Attach measured Gemini token usage (if any) so the web app can cost it.
+    if isinstance(result, dict) and _USAGE:
+        result.setdefault("usage", _usage_list())
+
+    print(json.dumps(result))
     return 0
 
 
