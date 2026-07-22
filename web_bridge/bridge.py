@@ -816,6 +816,49 @@ def _activities(payload: dict[str, Any]) -> dict[str, Any]:
             activities.append(rec)
             time.sleep(0.2)  # be gentle on the Garmin API across many detail calls
 
+        # Multisport legs never appear in get_activities_by_date — only the
+        # parent does — so fetch each parent's legs explicitly via its childIds.
+        # The legs land as first-class activities carrying parent_id; the web
+        # app derives the parent's missing stats (avg HR, moving time) from
+        # them. Transitions bucket to no sport and are skipped by the filter.
+        seen_ids = {rec["garmin_activity_id"] for rec in activities}
+        legs_wanted: list[tuple[Any, Any]] = []  # (child_id, parent_id)
+        for rec in activities:
+            if not rec.get("is_multisport_parent"):
+                continue
+            meta = (rec.get("summary") or {}).get("metadataDTO") or {}
+            for cid in meta.get("childIds") or []:
+                if cid and cid not in seen_ids:
+                    legs_wanted.append((cid, rec["garmin_activity_id"]))
+        for cid, pid in legs_wanted:
+            try:
+                detail = api.get_activity(str(cid))
+            except Exception:  # noqa: BLE001 - one bad leg can't kill the batch
+                continue
+            detail.pop("userRoles", None)
+            rec = _extract_activity(detail)
+            if not rec.get("sport"):
+                continue
+            rec["parent_id"] = pid
+            if include_splits:
+                try:
+                    rec["splits"] = api.get_activity_typed_splits(str(cid))
+                except Exception:  # noqa: BLE001
+                    rec["splits"] = None
+            try:
+                rec["hr_zones"] = _compact_zones(api.get_activity_hr_in_timezones(str(cid)))
+            except Exception:  # noqa: BLE001
+                rec["hr_zones"] = None
+            if rec.get("sport") == "bike":
+                try:
+                    rec["power_zones"] = _compact_zones(
+                        api.get_activity_power_in_timezones(str(cid))
+                    )
+                except Exception:  # noqa: BLE001
+                    rec["power_zones"] = None
+            activities.append(rec)
+            time.sleep(0.2)
+
         # Refine multisport parents to "triathlon" when their legs are the classic
         # swim+bike+run. Children carry parent_id; the parent is is_multisport_parent.
         legs_by_parent: dict[Any, set[str]] = {}
