@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 class CalendarOp(BaseModel):
@@ -63,6 +63,56 @@ class CoachOutput(BaseModel):
 WorkoutStep.model_rebuild()
 
 
+# Fields a WorkoutStep dict may legitimately carry — used to rebuild a step the
+# model occasionally flattens into a list of its own alternating keys/values.
+_STEP_KEYS = {"kind", "end", "value", "target", "low", "high", "note", "iterations", "steps"}
+
+
+def _rebuild_flat_step(flat: list[Any]) -> dict[str, Any] | None:
+    """Gemini sometimes emits a nested step as a flat list of its keys and
+    values, e.g. ["kind","active","end","time","value",60,...]. Pair them back
+    into a dict, keeping only recognised keys. Returns None if it isn't clearly
+    one step (no usable ``kind``)."""
+    out: dict[str, Any] = {}
+    i = 0
+    while i + 1 < len(flat):
+        key, val = flat[i], flat[i + 1]
+        if isinstance(key, str) and key in _STEP_KEYS:
+            out[key] = val
+            i += 2
+        else:
+            i += 1
+    return out if isinstance(out.get("kind"), str) and out["kind"] else None
+
+
+def _coerce_steps(steps: Any) -> list[dict[str, Any]]:
+    """Best-effort repair of a workout ``steps`` list the model may have garbled,
+    recursing into nested repeat blocks. A list flattened into scalars is
+    rebuilt into a single step; stray non-dict entries are dropped. Anything we
+    can't recover is discarded so one bad step never fails the whole plan."""
+    if not isinstance(steps, list):
+        return []
+    # Whole list flattened into a single step's scalars.
+    if steps and all(not isinstance(s, dict) for s in steps):
+        rebuilt = _rebuild_flat_step(steps)
+        return [rebuilt] if rebuilt else []
+    out: list[dict[str, Any]] = []
+    for s in steps:
+        if isinstance(s, dict):
+            if "steps" in s:
+                s["steps"] = _coerce_steps(s.get("steps"))
+            out.append(s)
+    return out
+
+
+def _repair_coach_output(data: dict[str, Any]) -> None:
+    """In place: sanitise each daily session's structured steps so a garbled
+    workout degrades to (at worst) an unstructured session instead of raising."""
+    for session in data.get("daily_sessions") or []:
+        if isinstance(session, dict) and "steps" in session:
+            session["steps"] = _coerce_steps(session.get("steps"))
+
+
 def run_coach(
     *,
     api_key: str,
@@ -94,11 +144,21 @@ def run_coach(
     )
 
     # Prefer the SDK's parsed object; fall back to parsing the raw text.
-    parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, CoachOutput):
-        return parsed
+    try:
+        parsed = response.parsed
+        if isinstance(parsed, CoachOutput):
+            return parsed
+    except ValidationError:
+        pass  # malformed structured output — repair below
+
     data: dict[str, Any] = json.loads(response.text)
-    return CoachOutput.model_validate(data)
+    try:
+        return CoachOutput.model_validate(data)
+    except ValidationError:
+        # Gemini occasionally garbles a nested workout step; repair the steps
+        # (dropping the unrecoverable) so the refresh still succeeds.
+        _repair_coach_output(data)
+        return CoachOutput.model_validate(data)
 
 
 class RacePrediction(BaseModel):
@@ -123,31 +183,64 @@ def predict_races(
     metrics_json: str,
     races_json: str,
     today: str,
+    past_races_json: str = "[]",
 ) -> RacePredictions:
     """Predict swim/bike/run splits + overall finish time for each race.
 
     Grounded in the athlete's current fitness (FTP, VO2 max, threshold pace/HR,
-    recent activities) and each race's distance and terrain.
+    recent activities), each race's distance and terrain, and — most
+    importantly — the athlete's OWN past race results, which anchor the
+    prediction to what they have actually produced rather than a best-case
+    extrapolation from fitness markers.
     """
     client = genai.Client(api_key=api_key)
 
     user_content = (
         f"Today's date: {today}.\n\n"
         f"=== ATHLETE FITNESS (JSON) ===\n{metrics_json}\n\n"
+        f"=== ATHLETE'S OWN PAST RACE RESULTS (JSON: per-leg distance, time and pace, + finish) ===\n"
+        f"{past_races_json}\n\n"
         f"=== RACES TO PREDICT (JSON) ===\n{races_json}\n\n"
-        "For each race, predict realistic swim, bike and run split times and the overall finish "
-        "time. Base it on the athlete's current fitness (FTP, VO2 max, threshold pace/HR, recent "
-        "activities) and the race's distance and terrain (use the location/notes for hills, "
-        "altitude, water, etc.). When a race includes a course_profile (terrain, swim, typical "
-        "conditions, difficulty, previous years' results), calibrate the prediction to THAT "
-        "course — the same athlete can be many minutes slower on a hilly, rough-water course "
-        "than on a fast flat one, and prior-year results anchor what realistic times look like. "
+        "Predict each race's MOST LIKELY result for a well-prepared, well-executed race day — "
+        "neither a perfect-day ceiling nor a padded worst-case. Aim for the time the athlete would "
+        "most probably clock and let their real fitness show through. Build each split UP from the "
+        "athlete's actual fitness and recent training paces first (recent 5k/threshold run pace, "
+        "running/cycling power, swim pace), then adjust for the specific race. Do NOT deliberately "
+        "inflate the splits.\n\n"
+        "CALIBRATION:\n"
+        "- The athlete's OWN past race results anchor plausibility — calibrate to what they've "
+        "produced on comparable courses/distances, weighing each by how hard it was raced (an A "
+        "race is all-out; a C race is often trained through and slower than their true ability). "
+        "But TRUST clear gains in current fitness: if recent paces/power are faster, predict "
+        "faster. Never predict slower than current fitness supports just because an earlier race "
+        "was slow.\n"
+        "- USE PACE, NOT RAW SPLIT TIMES, from past races: each past leg lists its distance and "
+        "pace (swim per 100 m, run per km, bike km/h). Course lengths vary — a past leg may have "
+        "been on a short or long course — so take the PACE and apply it to THIS race's actual leg "
+        "distances (a standard sprint is ~750 m swim / ~20 km bike / ~5 km run unless the "
+        "course_profile says otherwise). Never copy a past split's absolute time.\n"
+        "- The athlete's stated goals/targets are ASPIRATION and context only — do NOT anchor the "
+        "predicted splits or finish to a goal or target time. Predict what they will most likely "
+        "actually do from fitness and history, even if that is slower (or faster) than their goal.\n\n"
+        "TRIATHLON / MULTISPORT PHYSIOLOGY — apply each factor ONCE and keep it proportionate; do "
+        "NOT stack penalties into a pessimistic time:\n"
+        "- Swim: open water is modestly slower than pool pace (sighting, chop, no walls/push-offs, "
+        "mass-start congestion).\n"
+        "- Bike: hold a sustainable fraction of FTP for the DURATION — intensity factor roughly "
+        "0.88–0.95 for a sprint, easing toward ~0.7 for long course. Never use raw FTP.\n"
+        "- Run: run off the bike, but the fade is SMALL for short races and grows with bike "
+        "duration — only a few percent slower than a fresh run of that distance for a sprint "
+        "(a fit athlete runs a sprint-tri run close to their standalone 5k pace), rising to perhaps "
+        "10–15% for long course. Do NOT apply a large run penalty to a sprint.\n"
+        "- Course & conditions: apply terrain, altitude and water from location/notes/course_profile.\n"
+        "- Scheduled commitments (e.g. travel, or a hard hike before the race) can matter, but keep "
+        "any such adjustment MODEST — only when the commitment is genuinely fatiguing AND close to "
+        "race day, and never let it dominate the prediction.\n\n"
         "Report two totals: `overall` is the ELAPSED time — the sum of the swim, bike and run "
         "splits with no transitions — and `official` is the official/chip time: elapsed plus "
-        "realistic T1 and T2 transitions for this race's size and transition-area layout "
-        "(typically 1:30–3:00 each; longer for big or spread-out venues). Format times as H:MM:SS "
-        "(or M:SS for short swims). Give a one-sentence rationale. Return exactly one entry per "
-        "race, echoing its race_id."
+        "realistic T1 and T2 transitions (typically 1:30–3:00 each; longer for big or spread-out "
+        "venues). Format times as H:MM:SS (or M:SS for short swims). Give a one-sentence rationale "
+        "that names the main factors. Return exactly one entry per race, echoing its race_id."
     )
 
     response = client.models.generate_content(
@@ -157,7 +250,7 @@ def predict_races(
             system_instruction=system_prompt,
             response_mime_type="application/json",
             response_schema=RacePredictions,
-            temperature=0.4,
+            temperature=0.2,
         ),
     )
 
@@ -532,22 +625,53 @@ def deep_analysis(
     """
     client = genai.Client(api_key=api_key)
 
+    # What to scrutinise per sport. Endurance sports get technique/efficiency
+    # framing; the load sports below get a load-and-intensity framing instead
+    # (they have no device technique metric to reason about).
+    technique_focus = {
+        "run": "vertical oscillation and vertical ratio (bounciness wastes energy), "
+        "ground contact time and its L/R balance, cadence and stride length",
+        "bike": "power distribution, normalized vs average power, cadence and any "
+        "L/R imbalance",
+        "swim": "SWOLF, stroke rate and distance per stroke",
+        "hike": "climbing efficiency (pace against elevation gain), heart-rate drift "
+        "on sustained climbs, and effort/pacing control on ascents versus descents",
+        "ski": "speed and heart-rate control across runs, elevation change, and how "
+        "effort and intensity hold up over the session",
+        "triathlon": "balance across the swim/bike/run legs, transition efficiency, "
+        "and whether hard early legs cost the later ones",
+        "multisport": "balance across the individual legs, transition efficiency, and "
+        "pacing consistency across the disciplines",
+    }
+    load_sports = {"strength", "hockey", "cardio"}
+
+    if sport in load_sports:
+        guidance = (
+            f"{sport.capitalize()} has no device technique metric, so analyse it as a "
+            "load-and-intensity sport: training load, session intensity (heart-rate "
+            "distribution and time in zones), duration and volume, consistency and "
+            "progression across the weeks, and recovery demand (aerobic vs anaerobic "
+            "training effect). Give practical programming and load adjustments rather "
+            "than technique drills."
+        )
+    else:
+        focus = technique_focus.get(sport, "efficiency, pacing and consistency")
+        guidance = (
+            "Examine the history for efficiency losses, technique flaws, weaknesses "
+            f"and inefficiencies. For {sport}, scrutinise {focus}. For each issue give "
+            "the observation, why it matters, concrete technique cues, and specific drills."
+        )
+
     user_content = (
         f"Today's date: {today}.\n\n"
         f"Perform a DEEP ANALYSIS of this athlete's {sport}.\n\n"
         f"=== RECENT {sport.upper()} ACTIVITIES (JSON, one row per session) ===\n"
         f"{activities_json}\n\n"
-        "Examine the history for efficiency losses, technique flaws, weaknesses and "
-        "inefficiencies. Look at trends and consistency, not just averages. Cite the "
-        "athlete's actual numbers. For running, scrutinise vertical oscillation and "
-        "vertical ratio (bounciness wastes energy), ground contact time and its L/R "
-        "balance, cadence and stride length; for cycling, power distribution, "
-        "normalized vs average power, cadence and any L/R imbalance; for swimming, "
-        "SWOLF, stroke rate and distance per stroke. Only reason about metrics that are "
-        "present in the data — never invent values. For each issue give the observation, "
-        "why it matters, concrete technique cues, and specific drills. Rank findings by "
-        "severity (priority/notable/minor) and call out genuine strengths too. Finish "
-        "with the few highest-impact things to focus on next."
+        "Look at trends and consistency, not just averages. Cite the athlete's actual "
+        "numbers. Only reason about metrics that are present in the data — never invent "
+        f"values.\n\n{guidance}\n\n"
+        "Rank findings by severity (priority/notable/minor) and call out genuine "
+        "strengths too. Finish with the few highest-impact things to focus on next."
     )
 
     response = client.models.generate_content(
@@ -605,6 +729,43 @@ def illustrate(*, api_key: str, model: str, prompts: list[dict]) -> list[dict]:
     return out
 
 
+class ChatResult(BaseModel):
+    """A coach chat turn. `reply` is always the conversational answer; the plan
+    fields are only populated when the athlete's message warrants a change to
+    their training (then the job applies them exactly like a plan refresh)."""
+
+    reply: str
+    plan_changed: bool = False
+    plan_markdown: str = ""  # FULL revised plan, only when plan_changed
+    daily_sessions: list[DailySession] = []  # next ~14 days, only when plan_changed
+
+
+_CHAT_INSTRUCTION = """
+You are the athlete's coach in an ongoing conversation. ALWAYS put your answer in
+`reply` — conversational, concise, and grounded in the context above (their plan,
+upcoming schedule, metrics and races). Answer questions, discuss training, and use
+the earlier turns of the thread for context.
+
+Only change their training when the conversation genuinely calls for it — they ask
+you to change the plan or a specific session, or they report something that
+requires adjusting upcoming training (injury, illness, travel, a scheduling
+conflict, a missed or added session, a new constraint). When that happens:
+  - set `plan_changed` to true,
+  - return the FULL revised plan in `plan_markdown` (keep the
+    "## Current Fitness Snapshot (based on Garmin Metrics)" section first if the
+    current plan has one),
+  - return the next ~14 days in `daily_sessions` (one entry per day), changing
+    only what needs to change and leaving the other days as they were, and
+  - in `reply`, briefly say what you changed and why.
+Populate `daily_sessions[].steps` for structured swim/bike/run sessions the same
+way the plan does; leave steps empty for rest/strength/unstructured days.
+
+For everything else — questions, check-ins, advice, encouragement — leave
+`plan_changed` false and `plan_markdown`/`daily_sessions` empty. Never rewrite the
+plan just to answer a question.
+"""
+
+
 def chat_reply(
     *,
     api_key: str,
@@ -612,8 +773,13 @@ def chat_reply(
     system_prompt: str,
     history: list[dict[str, str]],
     message: str,
-) -> str:
-    """Free-form coach chat. `history` is [{'role': 'user'|'coach', 'body': ...}]."""
+    today: str = "",
+) -> ChatResult:
+    """Coach chat that can also edit the plan/schedule when warranted.
+
+    `history` is [{'role': 'user'|'coach', 'body': ...}]. Returns a ChatResult
+    whose plan fields are empty unless the athlete's message calls for a change.
+    """
     client = genai.Client(api_key=api_key)
 
     contents: list[types.Content] = []
@@ -624,12 +790,193 @@ def chat_reply(
         )
     contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
+    system = system_prompt + "\n\n" + _CHAT_INSTRUCTION
+    if today:
+        system += f"\n\nToday's date: {today}."
+
     response = client.models.generate_content(
         model=model,
         contents=contents,
         config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
+            system_instruction=system,
+            response_mime_type="application/json",
+            response_schema=ChatResult,
             temperature=0.7,
         ),
     )
-    return response.text or ""
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, ChatResult):
+        return parsed
+    data: dict[str, Any] = json.loads(response.text or "{}")
+    try:
+        return ChatResult.model_validate(data)
+    except ValidationError:
+        # Reuse the plan-step repair so a garbled workout never sinks the reply.
+        _repair_coach_output(data)
+        return ChatResult.model_validate(data)
+
+
+class SnapshotNotes(BaseModel):
+    """One short interpretive note per fitness-snapshot section (empty if the
+    section is absent). The numeric values + zones are computed by the web app;
+    these notes only add a sentence of meaning."""
+
+    hrv: str = ""
+    training_load: str = ""
+    vo2: str = ""
+    running_ftp: str = ""
+    cycling_ftp: str = ""
+
+
+def fitness_snapshot_notes(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    snapshot_json: str,
+) -> SnapshotNotes:
+    """Short interpretive one-liners for the athlete's computed fitness snapshot.
+
+    The values and zones are already computed and passed in; this only writes a
+    single grounded sentence of meaning per section.
+    """
+    client = genai.Client(api_key=api_key)
+
+    user_content = (
+        "Here is the athlete's current fitness snapshot, already computed from their Garmin "
+        f"metrics (JSON):\n{snapshot_json}\n\n"
+        "Write ONE short, specific interpretive sentence for each present section — what it "
+        "means for this athlete right now (recovery, readiness, trend, strength). Ground every "
+        "note in the numbers shown, don't merely restate them, and never invent values. Keep "
+        "each under ~15 words. Leave a field empty ('') if that section is missing."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=SnapshotNotes,
+            temperature=0.4,
+        ),
+    )
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, SnapshotNotes):
+        return parsed
+    data: dict[str, Any] = json.loads(response.text or "{}")
+    return SnapshotNotes.model_validate(data)
+
+
+class FtpPoint(BaseModel):
+    week: int  # weeks from today (0 = now)
+    cycling_ftp: int = 0  # watts; 0 if the athlete has no cycling FTP
+    running_ftp: int = 0  # watts; 0 if the athlete has no running FTP
+
+
+class FtpProjection(BaseModel):
+    points: list[FtpPoint]
+    rationale: str = ""
+
+
+def predict_ftp(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    current_json: str,
+    today: str = "",
+) -> FtpProjection:
+    """Project the athlete's cycling/running FTP over the next 12 weeks under
+    their current training plan (supplied in the system context)."""
+    client = genai.Client(api_key=api_key)
+
+    user_content = (
+        f"Today's date: {today}.\n\n"
+        f"=== CURRENT FTP + RECENT TREND (JSON) ===\n{current_json}\n\n"
+        "Project this athlete's cycling and running FTP over the next 12 WEEKS, assuming they "
+        "follow their CURRENT training plan (in the system context above). Return one point every "
+        "2 weeks: weeks 0, 2, 4, 6, 8, 10 and 12. Week 0 MUST equal their current FTP exactly.\n\n"
+        "Ground the trajectory in what the plan actually emphasises (threshold / sweet-spot volume, "
+        "build vs taper phases, time until A-races) and in realistic physiology: threshold power "
+        "moves slowly. A focused block might add roughly 3-8% over 12 weeks; expect less if the "
+        "athlete is already strong / near their ceiling, or if the plan is maintenance or tapering "
+        "(a taper can even dip slightly then rebound). Never project implausibly large jumps. If a "
+        "discipline has no current FTP, leave its values 0 for every week. Give a one-sentence "
+        "rationale naming the main driver."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=FtpProjection,
+            temperature=0.3,
+        ),
+    )
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, FtpProjection):
+        return parsed
+    data: dict[str, Any] = json.loads(response.text or "{}")
+    return FtpProjection.model_validate(data)
+
+
+class Vo2Point(BaseModel):
+    week: int  # weeks from today (0 = now)
+    running_vo2: float = 0  # ml/kg/min; 0 if the athlete has no running VO2 max
+    cycling_vo2: float = 0  # ml/kg/min; 0 if the athlete has no cycling VO2 max
+
+
+class Vo2Projection(BaseModel):
+    points: list[Vo2Point]
+    rationale: str = ""
+
+
+def predict_vo2(
+    *,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    current_json: str,
+    today: str = "",
+) -> Vo2Projection:
+    """Project the athlete's running/cycling VO₂ max over the next 12 weeks under
+    their current training plan (supplied in the system context)."""
+    client = genai.Client(api_key=api_key)
+
+    user_content = (
+        f"Today's date: {today}.\n\n"
+        f"=== CURRENT VO2 MAX + RECENT TREND (JSON) ===\n{current_json}\n\n"
+        "Project this athlete's running and cycling VO2 max over the next 12 WEEKS, assuming they "
+        "follow their CURRENT training plan (in the system context above). Return one point every "
+        "2 weeks: weeks 0, 2, 4, 6, 8, 10 and 12. Week 0 MUST equal their current VO2 max exactly.\n\n"
+        "Ground the trajectory in what the plan emphasises (high-intensity / VO2 interval work vs "
+        "base or taper) and in realistic physiology: VO2 max moves slowly and has a ceiling. A "
+        "focused block with real VO2 work might add ~1-3 points (ml/kg/min) over 12 weeks; expect "
+        "little to none if the athlete is already highly trained or the plan is base/maintenance, "
+        "and note a taper mostly preserves rather than builds it. Never project implausibly large "
+        "jumps. If a discipline has no current VO2 max, leave its values 0 for every week. Give a "
+        "one-sentence rationale naming the main driver."
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=Vo2Projection,
+            temperature=0.3,
+        ),
+    )
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, Vo2Projection):
+        return parsed
+    data: dict[str, Any] = json.loads(response.text or "{}")
+    return Vo2Projection.model_validate(data)

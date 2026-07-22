@@ -224,6 +224,28 @@ def collect_hr_summary(api: Garmin, end: date, zones: Any) -> dict[str, Any]:
     }
 
 
+def collect_athlete_profile(api: Garmin) -> dict[str, Any]:
+    """The athlete's demographics from their Garmin Connect profile: sex, height
+    (cm), weight (kg), and birth year. Lets the web app fill/keep the profile in
+    sync rather than asking the athlete to re-enter it."""
+    settings = safe_api_call("user_profile", api.get_user_profile) or {}
+    user = settings.get("userData", {}) if isinstance(settings, dict) else {}
+
+    gender = str(user.get("gender") or "").upper()
+    sex = "male" if gender == "MALE" else ("female" if gender == "FEMALE" else None)
+
+    weight_g = user.get("weight")  # Garmin stores weight in grams
+    weight_kg = round(weight_g / 1000, 1) if isinstance(weight_g, (int, float)) and weight_g else None
+
+    birth = str(user.get("birthDate") or "")
+    birth_year = int(birth[:4]) if len(birth) >= 4 and birth[:4].isdigit() else None
+
+    height = user.get("height")
+    height_cm = round(height) if isinstance(height, (int, float)) and height else None
+
+    return {"sex": sex, "height_cm": height_cm, "weight_kg": weight_kg, "birth_year": birth_year}
+
+
 def collect_activities(api: Garmin, end: date) -> list[dict[str, Any]]:
     start = (end - timedelta(days=ACTIVITY_DAYS - 1)).isoformat()
     acts = safe_api_call(
